@@ -6,7 +6,7 @@ Counter-Strike 2 POV recording automation. Largely AI-assisted and personalized 
 
 ### Requirements
 - **Python 3.10+**
-- **CS2** installed via Steam
+- **CS2** installed via Steam, with a Steam login
 - **FFmpeg** for video/audio capture
 - **xdotool** for window automation
 - **PulseAudio** for audio capture (pactl)
@@ -19,7 +19,7 @@ Install Python dependencies:
 ## Gentoo (based)
 emerge -av media-video/ffmpeg x11-misc/xdotool media-sound/pulseaudio
 
-## Ubuntu/Debian
+## Ubuntu/Debian (ig)
 apt install ffmpeg xdotool pulseaudio-utils
 ```
 
@@ -58,9 +58,18 @@ cs2pov [-h] --demo DEMO --player PLAYER --output OUTPUT [options]
 | `--audio-device` | | auto | PulseAudio device for audio capture |
 | `--no-trim` | | off | Skip post-processing, keep full recording |
 | `--display` | | 0 | X display number (0 = real display) |
-| `--cs2-path` | | auto | Path to CS2 installation |
+| `--cs2-path` | | auto | Path to CS2 installation (can also be CS2_PATH envvar) |
 | `--verbose` | `-v` | off | Verbose output |
 | `--version` | | | Show version |
+
+### Player Identification
+
+The `--player` argument accepts multiple formats:
+
+- **Player name**: `"PlayerName"` (case-insensitive, partial match supported)
+- **SteamID64**: `76561198012345678`
+- **SteamID**: `STEAM_0:1:12345678`
+- **SteamID3**: `[U:1:12345678]`
 
 ## How It Works
 
@@ -75,58 +84,6 @@ cs2pov [-h] --demo DEMO --player PLAYER --output OUTPUT [options]
 9. **Wait for demo end** - Monitor console.log for demo completion
 10. **Finalize** - Stop capture and terminate CS2
 11. **Post-process** - Trim start (until POV selected) and death periods from video
-
-### Player Identification
-
-The `--player` argument accepts multiple formats:
-
-- **Player name**: `"PlayerName"` (case-insensitive, partial match supported)
-- **SteamID64**: `76561198012345678`
-- **SteamID**: `STEAM_0:1:12345678`
-- **SteamID3**: `[U:1:12345678]`
-
-### Subcommands
-
-#### `list` - List players in a demo
-
-```bash
-cs2pov list /path/to/demo.dem
-```
-
-Shows all players with their names, teams, and SteamIDs.
-
-## Examples
-
-```bash
-# Basic recording
-cs2pov -d match.dem -p "s1mple" -o s1mple_pov.mp4
-
-# Record by SteamID
-cs2pov -d match.dem -p 76561198012345678 -o recording.mp4
-
-# Higher resolution, lower framerate
-cs2pov -d match.dem -p "Player" -o out.mp4 -r 2560x1440 -f 30
-
-# Hide HUD, verbose output
-cs2pov -d match.dem -p "Player" -o out.mp4 --no-hud -v
-
-# Custom CS2 installation path
-cs2pov -d match.dem -p "Player" -o out.mp4 --cs2-path /mnt/games/SteamLibrary/steamapps/common/Counter-Strike\ Global\ Offensive
-
-# Use virtual display (experimental, may not work with Vulkan)
-cs2pov -d match.dem -p "Player" -o out.mp4 --display 99
-```
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `CS2_PATH` | Path to CS2 installation (alternative to `--cs2-path`) |
-
-```bash
-export CS2_PATH="/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Global Offensive"
-cs2pov -d match.dem -p "Player" -o out.mp4
-```
 
 ## Noteworthy Issues/Workarounds
 
