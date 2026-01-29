@@ -1,0 +1,6 @@
+*.mp4
+*.log
+.claude/
+*egg-info*
+*__pycache__*
+.venv/
