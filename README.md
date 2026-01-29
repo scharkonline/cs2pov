@@ -13,7 +13,7 @@ Counter-Strike 2 POV recording automation. Largely AI-assisted and personalized 
 - **GPU** with Vulkan support (NVIDIA or AMD)
 
 ```bash
-Install Python dependencies:
+##Install Python dependencies:
 pip install -e .
 
 ## Gentoo (based)
