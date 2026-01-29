@@ -1,18 +1,26 @@
 # cs2pov
 
-Record a specific player's POV from Counter-Strike 2 demo files.
+Counter-Strike 2 POV recording automation. Largely AI-assisted and personalized to my system, maybe I'll make this more ubiquitous in the future.
 
 ## Installation
 
+### Requirements
+- **Python 3.10+**
+- **CS2** installed via Steam
+- **FFmpeg** for video/audio capture
+- **xdotool** for window automation
+- **PulseAudio** for audio capture (pactl)
+- **GPU** with Vulkan support (NVIDIA or AMD)
+
 ```bash
-# Install Python dependencies
-pip install -e .
+Install Python dependencies:
+`pip install -e .`
 
-# System dependencies (Gentoo)
-emerge -av media-video/ffmpeg
+## Gentoo (based)
+emerge -av media-video/ffmpeg x11-misc/xdotool media-sound/pulseaudio
 
-# System dependencies (Debian/Ubuntu)
-apt install ffmpeg
+## Ubuntu/Debian
+apt install ffmpeg xdotool pulseaudio-utils
 ```
 
 ## Quick Start
@@ -46,10 +54,27 @@ cs2pov [-h] --demo DEMO --player PLAYER --output OUTPUT [options]
 | `--resolution` | `-r` | 1920x1080 | Recording resolution |
 | `--framerate` | `-f` | 60 | Recording framerate |
 | `--no-hud` | | off | Hide HUD elements (except killfeed) |
+| `--no-audio` | | off | Disable audio recording |
+| `--audio-device` | | auto | PulseAudio device for audio capture |
+| `--no-trim` | | off | Skip post-processing, keep full recording |
 | `--display` | | 0 | X display number (0 = real display) |
 | `--cs2-path` | | auto | Path to CS2 installation |
 | `--verbose` | `-v` | off | Verbose output |
 | `--version` | | | Show version |
+
+## How It Works
+
+1. **Parse demo** - Extract player list and metadata using demoparser2
+2. **Generate config** - Create CS2 CFG file with spectator settings
+3. **Copy demo** - Place demo in CS2's replays directory
+4. **Launch CS2** - Start CS2 via Steam with the generated config
+5. **Wait for map load** - Monitor console.log for map load completion
+6. **Hide demo UI** - Send Shift+F2 to hide playback controls
+7. **Start capture** - Launch FFmpeg to record display + audio (PulseAudio)
+8. **Recording loop** - Send F5 periodically to keep spectator locked on target player
+9. **Wait for demo end** - Monitor console.log for demo completion
+10. **Finalize** - Stop capture and terminate CS2
+11. **Post-process** - Trim start (until POV selected) and death periods from video
 
 ### Player Identification
 
@@ -103,43 +128,16 @@ export CS2_PATH="/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Global 
 cs2pov -d match.dem -p "Player" -o out.mp4
 ```
 
-## Known Issues
+## Noteworthy Issues/Workarounds
 
 ### Recording Uses Your Real Display
 
-CS2 requires Vulkan, and virtual framebuffers (Xvfb) don't support Vulkan. The tool defaults to `--display 0` (your real display), which means:
-
-- CS2 will take over your screen during recording
-- You can't use your computer while recording
-- No need to restart your window manager or display server
-
-If you try `--display 99` (virtual display), you'll see: "The selected graphics queue does not support presenting a swapchain image"
+Due to some framebuffer stuff that's above my head, the tool defaults to `--display 0` (your real display) which means CS will take up your main display while recording. I mostly batch these at night so it's not a huge deal to me, but I'm hoping to experiment with headless recording in the future.
 
 ### Close CS2 Before Recording
 
-Steam prevents running multiple CS2 instances. Close any running CS2 before using cs2pov.
+You can't run multiple instances of CS through one account, so make sure it's closed ahead of time.
 
-### Camera May Drift During Rounds
+### Audio Capture
 
-CS2 doesn't support tick-accurate command injection (VDM files). The camera is locked to the target player at demo start but may drift during round transitions.
-
-## How It Works
-
-1. **Parse demo** - Extract player list and metadata using demoparser2
-2. **Generate config** - Create CS2 CFG file with spectator settings
-3. **Copy demo** - Place demo in CS2's replays directory
-4. **Start capture** - Launch FFmpeg to record the display
-5. **Launch CS2** - Start CS2 with the generated config
-6. **Wait** - CS2 plays the demo and exits automatically
-7. **Finalize** - Stop capture and save video
-
-## Requirements
-
-- **Python 3.10+**
-- **CS2** installed via Steam
-- **FFmpeg** for video capture
-- **GPU** with Vulkan support (NVIDIA or AMD)
-
-## License
-
-MIT
+I'm sorry for making you use Pulseaudio. The audio is captured from your default PulseAudio output so this captures all system audio, not just CS2.
