@@ -14,7 +14,7 @@ Counter-Strike 2 POV recording automation. Largely AI-assisted and personalized 
 
 ```bash
 Install Python dependencies:
-`pip install -e .`
+pip install -e .
 
 ## Gentoo (based)
 emerge -av media-video/ffmpeg x11-misc/xdotool media-sound/pulseaudio
