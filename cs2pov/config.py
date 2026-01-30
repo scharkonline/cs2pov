@@ -12,6 +12,7 @@ class RecordingConfig:
     player_index: int
     player_name: str = ""
     player_steamid: int = 0
+    player_slot: int = 0  # user_id + 1, used for spec_player command
     resolution: tuple[int, int] = (1920, 1080)
     hide_hud: bool = True
     spec_mode: int = 4  # 4 = first-person, 5 = third-person, 6 = free roam
@@ -45,8 +46,8 @@ spec_mode {spec_mode}
 // Auto-quit when demo ends
 demo_quitafterplayback 1
 
-// Create alias to lock to player by name (more reliable than index)
-alias "lock_pov" "spec_player \\"{player_name}\\""
+// Create alias to lock to player by slot number (user_id + 1)
+alias "lock_pov" "spec_player {player_slot}"
 
 // Bind F5 to lock to player (automation will press this)
 bind "F5" "lock_pov"
@@ -58,7 +59,7 @@ bind "MOUSE4" "lock_pov"
 playdemo "replays/{demo_name}"
 
 // These run before demo loads but we try anyway
-spec_player "{player_name}"
+spec_player {player_slot}
 spec_mode {spec_mode}
 
 // Tell user what's happening
@@ -96,6 +97,7 @@ def generate_recording_cfg(config: RecordingConfig, output_path: Path) -> Path:
         hud_commands=hud_commands,
         spec_mode=config.spec_mode,
         player_name=config.player_name,
+        player_slot=config.player_slot,
         demo_name=config.demo_name,
     )
 

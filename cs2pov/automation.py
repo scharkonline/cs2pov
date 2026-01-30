@@ -145,6 +145,56 @@ def wait_for_map_load(log_path: Path, timeout: float = 120, poll_interval: float
     return False
 
 
+def wait_for_first_spawn(
+    log_path: Path,
+    player_name: str,
+    timeout: float = 180,
+    poll_interval: float = 0.5
+) -> bool:
+    """Wait for first spawn of the target player by watching console.log.
+
+    Looks for: <player> spawned
+
+    This indicates the player has spawned and the POV camera is ready.
+
+    Args:
+        log_path: Path to CS2 console.log
+        player_name: Name of the player to watch for
+        timeout: Maximum time to wait in seconds
+        poll_interval: Time between checks
+
+    Returns:
+        True if first spawn detected, False if timeout
+    """
+    import time
+
+    spawn_pattern = re.compile(
+            rf"{re.escape(player_name)} spawned\b"
+    )
+    start = time.time()
+    last_position = 0
+
+    while time.time() - start < timeout:
+        if not log_path.exists():
+            time.sleep(poll_interval)
+            continue
+
+        try:
+            with open(log_path, 'r', errors='ignore') as f:
+                f.seek(last_position)
+                content = f.read()
+                last_position = f.tell()
+
+                if spawn_pattern.search(content):
+                    return True
+        except Exception:
+            pass
+
+        time.sleep(poll_interval)
+
+    return False
+
+
 def wait_for_cs2_window(display: str = ":0", timeout: float = 120, poll_interval: float = 2.0) -> Optional[str]:
     """Wait for CS2 window to appear.
 

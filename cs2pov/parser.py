@@ -17,6 +17,7 @@ class PlayerInfo:
     steamid: int
     name: str
     team: Optional[str] = None
+    user_id: Optional[int] = None  # Player slot from demo (use user_id + 1 for spec_player)
 
 
 @dataclass
@@ -67,7 +68,7 @@ def parse_demo(demo_path: Path) -> DemoInfo:
 
         # Get unique players from tick data
         # parse_ticks returns a DataFrame with steamid and name columns
-        tick_df = parser.parse_ticks(["team_num"])
+        tick_df = parser.parse_ticks(["team_num", "user_id"])
         players = _extract_players(tick_df)
 
         # Get round events
@@ -109,7 +110,10 @@ def _extract_players(tick_df) -> list[PlayerInfo]:
                     team = "T"
                 elif team_num == 3:
                     team = "CT"
-            players.append(PlayerInfo(steamid=steamid, name=name, team=team))
+            user_id = None
+            if "user_id" in row:
+                user_id = int(row["user_id"])
+            players.append(PlayerInfo(steamid=steamid, name=name, team=team, user_id=user_id))
 
     return players
 

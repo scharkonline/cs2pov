@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """CS2 POV Recorder - Record player POV from CS2 demo files.
 
-Simplified architecture with linear flow:
-1. Setup (parse demo, generate config, launch CS2)
-2. Recording loop (single-threaded, blocking)
-3. Cleanup (stop FFmpeg, kill CS2)
-4. Post-processing (trim death periods)
+Subcommand-based CLI:
+  pov     - Full pipeline (record + trim)
+  info    - Show demo information
+  record  - Raw recording only
+  trim    - Post-process existing video
 """
 
 import argparse
+import json
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -18,14 +18,19 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
-from .automation import check_xdotool, send_key, check_demo_ended, wait_for_cs2_window, wait_for_map_load
+from .automation import send_key, check_demo_ended, wait_for_cs2_window, wait_for_first_spawn
 from .capture import FFmpegCapture, get_default_audio_monitor
 from .config import RecordingConfig, generate_recording_cfg
 from .exceptions import CS2POVError
 from .game import CS2Process, find_cs2_path, get_cfg_dir, get_demo_dir
-from .parser import DemoInfo, find_player, get_player_index, parse_demo
-from .trim import extract_death_periods, trim_death_periods
+from .parser import DemoInfo, PlayerInfo, find_player, get_player_index, parse_demo
+from .preprocessor import DemoTimeline, preprocess_demo, get_trim_periods
+from .trim import extract_death_periods, TrimPeriod, trim_video_with_periods
 
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 @dataclass
 class RecordingResult:
@@ -36,7 +41,12 @@ class RecordingResult:
     recording_start_time: float
     player_slot: int
     exit_reason: str  # "demo_ended", "timeout", "ffmpeg_stopped", "interrupted"
+    timeline: Optional[DemoTimeline] = None
 
+
+# =============================================================================
+# Shared Utilities
+# =============================================================================
 
 def check_dependencies() -> list[str]:
     """Check for required system dependencies."""
@@ -57,17 +67,9 @@ def parse_resolution(resolution_str: str) -> tuple[int, int]:
         raise ValueError(f"Invalid resolution format: {resolution_str}. Use WxH (e.g., 1920x1080)")
 
 
-def print_demo_info(demo_info: DemoInfo):
-    """Print parsed demo information."""
-    print(f"  Map: {demo_info.map_name}")
-    print(f"  Ticks: {demo_info.total_ticks}")
-    print(f"  Tick rate: {demo_info.tick_rate}")
-    print(f"  Players: {len(demo_info.players)}")
-    for p in demo_info.players:
-        team_str = f" [{p.team}]" if p.team else ""
-        print(f"    - {p.name}{team_str} ({p.steamid})")
-    print(f"  Rounds: {len(demo_info.rounds)}")
-
+# =============================================================================
+# Recording Functions
+# =============================================================================
 
 def recording_loop(
     display: str,
@@ -78,14 +80,6 @@ def recording_loop(
     verbose: bool = False,
 ) -> str:
     """Main recording loop - single-threaded, blocking.
-
-    Args:
-        display: X display string
-        console_log_path: Path to CS2 console.log
-        cs2_process: CS2 process manager
-        ffmpeg: FFmpeg capture instance
-        timeout: Maximum recording time in seconds
-        verbose: Print verbose output
 
     Returns:
         Exit reason: "demo_ended", "cs2_exited", "timeout", "ffmpeg_stopped"
@@ -102,22 +96,18 @@ def recording_loop(
     while True:
         elapsed = time.time() - start_time
 
-        # Check timeout
         if elapsed > timeout:
             print(f"  Timeout reached ({timeout/60:.1f} min)")
             return "timeout"
 
-        # Check if CS2 still running
         if not cs2_process.is_running():
             print("  CS2 exited")
             return "cs2_exited"
 
-        # Check if FFmpeg still running
         if not ffmpeg.is_running():
             print("  FFmpeg stopped unexpectedly")
             return "ffmpeg_stopped"
 
-        # Check for demo end in console.log
         demo_ended, log_position = check_demo_ended(console_log_path, log_position)
         if demo_ended:
             print("  Demo end detected in console.log")
@@ -135,9 +125,10 @@ def recording_loop(
 
             if window_id:
                 send_key("F5", display, window_id)
+                if verbose:
+                    print(f"    Sending F5 (spec_lock)")
             last_spec_lock = elapsed
 
-        # Print status every 60 seconds
         if elapsed - last_status_time >= 60:
             print(f"    Still recording... ({elapsed/60:.1f} min)")
             last_status_time = elapsed
@@ -158,11 +149,7 @@ def record_demo(
     enable_audio: bool = True,
     audio_device: str | None = None,
 ) -> RecordingResult:
-    """Record a player's POV from a demo file.
-
-    This is a blocking function that handles the entire recording process.
-    Cleanup is handled in finally block - always runs.
-    """
+    """Record a player's POV from a demo file."""
     # Find CS2 installation
     print("Finding CS2 installation...")
     cs2_path = find_cs2_path(cs2_path_override)
@@ -171,16 +158,29 @@ def record_demo(
     # Parse demo
     print(f"Parsing demo: {demo_path.name}")
     demo_info = parse_demo(demo_path)
-    if verbose:
-        print_demo_info(demo_info)
-    else:
-        print(f"  Map: {demo_info.map_name}, {len(demo_info.players)} players")
-        print(f"  Ticks: {demo_info.total_ticks}, Rate: {demo_info.tick_rate}/s")
+    print(f"  Map: {demo_info.map_name}, {len(demo_info.players)} players")
+    print(f"  Ticks: {demo_info.total_ticks}, Rate: {demo_info.tick_rate}/s")
 
     # Find target player
     player = find_player(demo_info, player_identifier)
     player_index = get_player_index(demo_info, player)
-    print(f"Recording POV: {player.name} (SteamID: {player.steamid}, index: {player_index})")
+    # player_slot is user_id + 1 for spec_player command
+    player_slot = (player.user_id + 1) if player.user_id is not None else (player_index + 1)
+    print(f"Recording POV: {player.name} (SteamID: {player.steamid}, slot: {player_slot})")
+
+    # Preprocess demo for timeline data
+    print("Preprocessing demo for timeline data...")
+    try:
+        timeline = preprocess_demo(demo_path, player.steamid, player.name)
+        print(f"  Found {len(timeline.deaths)} deaths, {len(timeline.spawns)} spawns, "
+              f"{len(timeline.rounds)} rounds")
+        if verbose and timeline.death_periods:
+            total_dead = sum(p.duration_seconds for p in timeline.death_periods)
+            print(f"  Total dead time: {total_dead:.1f}s across {len(timeline.death_periods)} death periods")
+    except Exception as e:
+        print(f"  Warning: Preprocessing failed: {e}")
+        print(f"  Will fall back to console.log parsing for trim")
+        timeline = None
 
     # Prepare directories
     demo_dir = get_demo_dir(cs2_path)
@@ -204,6 +204,7 @@ def record_demo(
         player_index=player_index,
         player_name=player.name,
         player_steamid=player.steamid,
+        player_slot=player_slot,
         resolution=resolution,
         hide_hud=hide_hud,
     )
@@ -223,20 +224,19 @@ def record_demo(
         estimated_duration = demo_info.total_ticks / demo_info.tick_rate
     else:
         estimated_duration = 3600
-    timeout = estimated_duration + 600  # Add 10 min buffer
+    timeout = estimated_duration + 600
 
     print(f"Starting recording (timeout: {timeout/60:.1f} min)...")
     print(f"  Display: {display_str}")
     print(f"  Output: {output_path}")
 
-    # Initialize objects
     cs2_process: Optional[CS2Process] = None
     ffmpeg: Optional[FFmpegCapture] = None
     recording_start_time = 0.0
     exit_reason = "unknown"
 
     try:
-        # Delete old console.log to ensure fresh log for this recording
+        # Delete old console.log
         if console_log_path.exists():
             console_log_path.unlink()
             if verbose:
@@ -247,7 +247,7 @@ def record_demo(
         cs2_process.launch("cs2pov_recording.cfg")
         print("  CS2 launching via Steam...")
 
-        # Wait for CS2 window to appear
+        # Wait for CS2 window
         print("  Waiting for CS2 window...")
         window_id = wait_for_cs2_window(display_str, timeout=120)
         if window_id:
@@ -255,19 +255,20 @@ def record_demo(
         else:
             print("  Warning: CS2 window not detected, continuing anyway")
 
-        # Wait for map to load, then hide demo UI with Shift+F2
-        print("  Waiting for map to load...")
-        if wait_for_map_load(console_log_path, timeout=120):
+        # Wait for first player spawn
+        print(f"  Waiting for first spawn ({player.name})...")
+        if wait_for_first_spawn(console_log_path, player.name, timeout=180):
+            print("  First spawn detected")
             if verbose:
-                print("  Map loaded, waiting 10s before hiding UI...")
-            time.sleep(10)
+                print("  Waiting 15s for game to stabilize...")
+            time.sleep(15)
             if window_id and send_key("shift+F2", display_str, window_id):
                 if verbose:
                     print("  Sent Shift+F2 to hide demo UI")
             elif window_id:
                 print("  Warning: Failed to send Shift+F2 to hide demo UI")
         else:
-            print("  Warning: Map load not detected, continuing anyway")
+            print("  Warning: First spawn not detected, continuing anyway")
 
         # Determine audio source
         audio_source = None
@@ -279,7 +280,7 @@ def record_demo(
             else:
                 print("  Warning: Could not detect audio device, recording video only")
 
-        # Start FFmpeg capture (full display + audio)
+        # Start FFmpeg capture
         ffmpeg = FFmpegCapture(
             display=display_str,
             output_path=output_path,
@@ -294,10 +295,8 @@ def record_demo(
         else:
             print(f"  FFmpeg capture started (video only)")
 
-        # Record start time for death period extraction
         recording_start_time = time.time()
 
-        # Run main recording loop (blocking)
         exit_reason = recording_loop(
             display=display_str,
             console_log_path=console_log_path,
@@ -312,10 +311,8 @@ def record_demo(
         exit_reason = "interrupted"
 
     finally:
-        # Cleanup - always runs
         print("\nCleaning up...")
 
-        # Stop FFmpeg first (so video file is finalized)
         if ffmpeg:
             print("  Stopping FFmpeg...")
             graceful = ffmpeg.stop(timeout=15)
@@ -326,22 +323,18 @@ def record_demo(
             if ffmpeg.stderr_path and ffmpeg.stderr_path.exists():
                 print(f"  FFmpeg log: {ffmpeg.stderr_path}")
 
-        # Then stop CS2
         if cs2_process and cs2_process.is_running():
             print("  Terminating CS2...")
             cs2_process.terminate()
 
         print("  Cleanup complete")
 
-        # Save console.log with demo-matching name for retention
         if console_log_path.exists():
             saved_log_path = output_path.parent / f"console_{demo_path.stem}.log"
             shutil.copy2(console_log_path, saved_log_path)
             print(f"  Console log saved: {saved_log_path.name}")
-            # Update path for post-processing to use the saved copy
             console_log_path = saved_log_path
 
-    # Return result with metadata for post-processing
     success = exit_reason in ("demo_ended", "cs2_exited")
     return RecordingResult(
         success=success,
@@ -350,6 +343,7 @@ def record_demo(
         recording_start_time=recording_start_time,
         player_slot=player_index,
         exit_reason=exit_reason,
+        timeline=timeline,
     )
 
 
@@ -359,11 +353,9 @@ def postprocess_video(
     player_slot: int,
     recording_start_time: float,
     verbose: bool = False,
+    timeline: Optional[DemoTimeline] = None,
 ) -> Path:
-    """Post-process a recorded video to trim death periods.
-
-    This is a separate phase that can be run independently.
-    """
+    """Post-process a recorded video to trim death periods."""
     if not video_path.exists():
         print(f"Error: Video file not found: {video_path}")
         return video_path
@@ -371,38 +363,65 @@ def postprocess_video(
     raw_size_mb = video_path.stat().st_size / (1024 * 1024)
     print(f"\nRaw recording: {video_path} ({raw_size_mb:.1f} MB)")
 
-    print("\nPost-processing: extracting death periods...")
-    if verbose:
-        print(f"  Console log: {console_log_path}")
-        print(f"  Player slot: {player_slot}")
-        print(f"  Recording start: {recording_start_time}")
+    print("\nPost-processing: extracting trim periods...")
 
-    if not console_log_path.exists():
-        print(f"  Console log not found, skipping trim")
-        return video_path
+    trim_periods: list[TrimPeriod] = []
 
-    death_periods = extract_death_periods(
-        log_path=console_log_path,
-        player_slot=player_slot,
-        recording_start_time=recording_start_time,
-        verbose=verbose
-    )
+    # Prefer timeline data
+    if timeline is not None and timeline.spawns:
+        print("  Using preprocessed timeline data (demoparser2)")
+        if verbose:
+            print(f"  Deaths: {len(timeline.deaths)}, Spawns: {len(timeline.spawns)}")
 
-    if death_periods:
-        print(f"  Found {len(death_periods)} death periods")
-        total_dead_time = sum(p.duration for p in death_periods)
-        print(f"  Total dead time: {total_dead_time:.1f}s")
+        demo_trim_periods = get_trim_periods(timeline)
 
-        # Rename original to _raw
+        if demo_trim_periods:
+            for start, end in demo_trim_periods:
+                trim_periods.append(TrimPeriod(start_time=start, end_time=end))
+                if verbose:
+                    print(f"    Period: {start:.2f}s - {end:.2f}s ({end - start:.2f}s)")
+
+    # Fall back to console.log parsing
+    if not trim_periods:
+        if timeline is not None:
+            print("  Timeline has no spawn data, falling back to console.log")
+        else:
+            print("  Using console.log parsing (legacy method)")
+
+        if verbose:
+            print(f"  Console log: {console_log_path}")
+            print(f"  Player slot: {player_slot}")
+            print(f"  Recording start: {recording_start_time}")
+
+        if not console_log_path.exists():
+            print(f"  Console log not found, skipping trim")
+            print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
+            return video_path
+
+        death_periods = extract_death_periods(
+            log_path=console_log_path,
+            player_slot=player_slot,
+            recording_start_time=recording_start_time,
+            verbose=verbose
+        )
+
+        for dp in death_periods:
+            trim_periods.append(TrimPeriod(start_time=dp.death_time, end_time=dp.respawn_time))
+
+    if trim_periods:
+        print(f"  Found {len(trim_periods)} periods to trim")
+        total_trim_time = sum(p.duration for p in trim_periods)
+        print(f"  Total trim time: {total_trim_time:.1f}s")
+
         raw_path = video_path.parent / f"{video_path.stem}_raw{video_path.suffix}"
         video_path.rename(raw_path)
         print(f"  Raw recording moved to: {raw_path.name}")
 
-        print("  Trimming death periods...")
-        success = trim_death_periods(
+        print("  Trimming periods from video...")
+        success = trim_video_with_periods(
             input_path=raw_path,
             output_path=video_path,
-            death_periods=death_periods,
+            trim_periods=trim_periods,
             verbose=verbose
         )
 
@@ -414,62 +433,287 @@ def postprocess_video(
             if not video_path.exists() and raw_path.exists():
                 raw_path.rename(video_path)
     else:
-        print("  No death periods found, keeping original")
+        print("  No periods to trim, keeping original")
         print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
 
     return video_path
 
 
-def main():
-    """Main entry point."""
+# =============================================================================
+# Info Output Functions
+# =============================================================================
+
+def print_demo_info_extended(
+    demo_info: DemoInfo,
+    timelines: dict[int, DemoTimeline],
+    verbose: bool = False
+):
+    """Print comprehensive demo information."""
+    # Get rounds and duration from timeline data (more reliable than header)
+    rounds_count = 0
+    max_tick = 0
+    tickrate = demo_info.tick_rate or 64
+
+    for timeline in timelines.values():
+        if timeline.rounds:
+            rounds_count = max(rounds_count, len(timeline.rounds))
+        # Find max tick from spawns/deaths to calculate duration
+        for spawn in timeline.spawns:
+            max_tick = max(max_tick, spawn.tick)
+        for death in timeline.deaths:
+            max_tick = max(max_tick, death.tick)
+        if timeline.tickrate > 0:
+            tickrate = timeline.tickrate
+
+    # Calculate duration from max tick
+    if max_tick > 0 and tickrate > 0:
+        duration = max_tick / tickrate
+        duration_str = f"{duration:.1f}s ({duration/60:.1f} min)"
+    elif demo_info.total_ticks > 0 and tickrate > 0:
+        duration = demo_info.total_ticks / tickrate
+        duration_str = f"{duration:.1f}s ({duration/60:.1f} min)"
+    else:
+        duration_str = "unknown"
+
+    print(f"Demo: {demo_info.path.name}")
+    print(f"  Map: {demo_info.map_name}")
+    print(f"  Tick rate: {tickrate}/s")
+    print(f"  Duration: {duration_str}")
+    print(f"  Rounds: {rounds_count}")
+
+    print(f"\nPlayers ({len(demo_info.players)}):")
+    for player in demo_info.players:
+        team_str = f"[{player.team}]" if player.team else "[--]"
+        timeline = timelines.get(player.steamid)
+
+        print(f"  {player.name}")
+        print(f"    SteamID: {player.steamid}  Team: {team_str}")
+
+        if timeline:
+            death_count = len(timeline.deaths)
+            spawn_count = len(timeline.spawns)
+            dead_time = sum(p.duration_seconds for p in timeline.death_periods)
+            print(f"    Deaths: {death_count}, Spawns: {spawn_count}, Dead time: {dead_time:.1f}s")
+
+            if verbose and timeline.death_periods:
+                print(f"    Death periods:")
+                for i, period in enumerate(timeline.death_periods, 1):
+                    weapon = period.death.weapon or "unknown"
+                    hs = " (headshot)" if period.death.headshot else ""
+                    print(f"      {i:2}. {period.death.time_seconds:7.1f}s - {period.spawn.time_seconds:7.1f}s "
+                          f"({period.duration_seconds:5.1f}s) [{weapon}{hs}]")
+
+
+def format_info_json(
+    demo_info: DemoInfo,
+    timelines: dict[int, DemoTimeline]
+) -> dict:
+    """Format demo info as JSON-serializable dict."""
+    # Get rounds and duration from timeline data (more reliable than header)
+    rounds_count = 0
+    max_tick = 0
+    tickrate = demo_info.tick_rate or 64
+
+    for timeline in timelines.values():
+        if timeline.rounds:
+            rounds_count = max(rounds_count, len(timeline.rounds))
+        for spawn in timeline.spawns:
+            max_tick = max(max_tick, spawn.tick)
+        for death in timeline.deaths:
+            max_tick = max(max_tick, death.tick)
+        if timeline.tickrate > 0:
+            tickrate = timeline.tickrate
+
+    # Calculate duration from max tick
+    if max_tick > 0 and tickrate > 0:
+        duration = max_tick / tickrate
+    elif demo_info.total_ticks > 0 and tickrate > 0:
+        duration = demo_info.total_ticks / tickrate
+    else:
+        duration = 0
+
+    players_data = []
+    for player in demo_info.players:
+        timeline = timelines.get(player.steamid)
+        player_data = {
+            "name": player.name,
+            "steamid": player.steamid,
+            "team": player.team,
+        }
+
+        if timeline:
+            player_data["deaths"] = len(timeline.deaths)
+            player_data["spawns"] = len(timeline.spawns)
+            player_data["dead_time_seconds"] = sum(p.duration_seconds for p in timeline.death_periods)
+            player_data["death_periods"] = [
+                {
+                    "death_tick": p.death.tick,
+                    "death_time": p.death.time_seconds,
+                    "spawn_tick": p.spawn.tick,
+                    "spawn_time": p.spawn.time_seconds,
+                    "duration_seconds": p.duration_seconds,
+                    "weapon": p.death.weapon,
+                    "headshot": p.death.headshot,
+                }
+                for p in timeline.death_periods
+            ]
+
+        players_data.append(player_data)
+
+    return {
+        "demo": demo_info.path.name,
+        "map": demo_info.map_name,
+        "tick_rate": tickrate,
+        "duration_seconds": duration,
+        "rounds": rounds_count,
+        "players": players_data,
+    }
+
+
+# =============================================================================
+# Argument Parser
+# =============================================================================
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create argument parser with subcommands."""
     parser = argparse.ArgumentParser(
-        description="Record a player's POV from a CS2 demo file",
+        prog="cs2pov",
+        description="Record player POV from CS2 demo files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  %(prog)s -d match.dem -p "PlayerName" -o recording.mp4
-  %(prog)s -d match.dem -p "PlayerName" -o recording.mp4 --no-trim
-  %(prog)s -d match.dem -p "PlayerName" -o recording.mp4 --skip-recording \\
-    --console-log /path/to/console.log --player-slot 3 --recording-start-time 1706500000
+  cs2pov info demo.dem                     # Show demo information
+  cs2pov info demo.dem --json              # Output as JSON
+  cs2pov pov -d demo.dem -p "Player" -o out.mp4
+  cs2pov record -d demo.dem -p "Player" -o raw.mp4
+  cs2pov trim raw.mp4 -d demo.dem -p "Player"
 """,
     )
-
-    parser.add_argument("-d", "--demo", required=True, type=Path, help="Path to demo file (.dem)")
-    parser.add_argument("-p", "--player", required=True, help="Player to record (name or SteamID)")
-    parser.add_argument("-o", "--output", required=True, type=Path, help="Output video file path")
-    parser.add_argument("-r", "--resolution", default="1920x1080", help="Recording resolution")
-    parser.add_argument("-f", "--framerate", type=int, default=60, help="Recording framerate")
-    parser.add_argument("--no-hud", action="store_true", help="Hide HUD elements")
-    parser.add_argument("--display", type=int, default=0, help="X display number")
-    parser.add_argument("--no-audio", action="store_true", help="Disable audio recording")
-    parser.add_argument("--audio-device", help="PulseAudio device for audio capture (auto-detected by default)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
-    parser.add_argument("--cs2-path", type=Path, help="Path to CS2 installation")
-    parser.add_argument("--no-trim", action="store_true", help="Skip post-processing trim")
-    parser.add_argument("--skip-recording", action="store_true", help="Skip recording, only post-process")
-    parser.add_argument("--console-log", type=Path, help="Console log path (for --skip-recording)")
-    parser.add_argument("--player-slot", type=int, help="Player slot (for --skip-recording)")
-    parser.add_argument("--recording-start-time", type=float, help="Recording start time (for --skip-recording)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
-    # Subcommand for listing players
-    subparsers = parser.add_subparsers(dest="command")
-    list_parser = subparsers.add_parser("list", help="List players in a demo")
-    list_parser.add_argument("demo", type=Path, help="Path to demo file")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    args = parser.parse_args()
+    # Shared argument groups
+    demo_args = argparse.ArgumentParser(add_help=False)
+    demo_args.add_argument("-d", "--demo", required=True, type=Path,
+                           help="Demo file (.dem)")
 
-    # Handle list subcommand
-    if args.command == "list":
+    player_args = argparse.ArgumentParser(add_help=False)
+    player_args.add_argument("-p", "--player", required=True,
+                             help="Player name or SteamID")
+
+    output_args = argparse.ArgumentParser(add_help=False)
+    output_args.add_argument("-o", "--output", required=True, type=Path,
+                             help="Output video file")
+
+    recording_args = argparse.ArgumentParser(add_help=False)
+    recording_args.add_argument("-r", "--resolution", default="1920x1080",
+                                help="Recording resolution (default: 1920x1080)")
+    recording_args.add_argument("-f", "--framerate", type=int, default=60,
+                                help="Recording framerate (default: 60)")
+    recording_args.add_argument("--display", type=int, default=0,
+                                help="X display number (default: 0)")
+    recording_args.add_argument("--no-hud", action="store_true",
+                                help="Hide HUD elements")
+    recording_args.add_argument("--no-audio", action="store_true",
+                                help="Disable audio recording")
+    recording_args.add_argument("--audio-device",
+                                help="PulseAudio device (auto-detected)")
+    recording_args.add_argument("--cs2-path", type=Path,
+                                help="Custom CS2 installation path")
+
+    verbose_args = argparse.ArgumentParser(add_help=False)
+    verbose_args.add_argument("-v", "--verbose", action="store_true",
+                              help="Verbose output")
+
+    # INFO command
+    info_parser = subparsers.add_parser(
+        "info",
+        parents=[verbose_args],
+        help="Show demo information and player timeline data",
+        description="Display demo metadata, player list, and death/spawn statistics.",
+    )
+    info_parser.add_argument("demo", type=Path, help="Demo file (.dem)")
+    info_parser.add_argument("--json", action="store_true",
+                             help="Output as JSON")
+
+    # POV command (full pipeline)
+    pov_parser = subparsers.add_parser(
+        "pov",
+        parents=[demo_args, player_args, output_args, recording_args, verbose_args],
+        help="Record and trim player POV (full pipeline)",
+        description="Record a player's POV from a demo and trim death periods.",
+    )
+    pov_parser.add_argument("--no-trim", action="store_true",
+                            help="Skip post-processing trim")
+
+    # RECORD command
+    subparsers.add_parser(
+        "record",
+        parents=[demo_args, player_args, output_args, recording_args, verbose_args],
+        help="Record player POV without trimming",
+        description="Record a player's POV from a demo without post-processing.",
+    )
+
+    # TRIM command
+    trim_parser = subparsers.add_parser(
+        "trim",
+        parents=[demo_args, player_args, verbose_args],
+        help="Trim death periods from recorded video",
+        description="Post-process an existing recording to remove death periods.",
+    )
+    trim_parser.add_argument("video", type=Path, help="Input video file")
+    trim_parser.add_argument("-o", "--output", type=Path,
+                             help="Output file (default: adds _trimmed suffix)")
+    # Fallback options
+    trim_parser.add_argument("--console-log", type=Path,
+                             help="Console.log file (fallback when demo unavailable)")
+    trim_parser.add_argument("--player-slot", type=int,
+                             help="Player slot, 0-based (fallback)")
+    trim_parser.add_argument("--recording-start-time", type=float,
+                             help="Recording start timestamp (fallback)")
+
+    return parser
+
+
+# =============================================================================
+# Command Handlers
+# =============================================================================
+
+def cmd_info(args) -> int:
+    """Handle 'info' command - show demo information."""
+    demo_path = args.demo.resolve()
+    if not demo_path.exists():
+        print(f"Error: Demo not found: {demo_path}", file=sys.stderr)
+        return 1
+
+    # Parse basic demo info
+    try:
+        demo_info = parse_demo(demo_path)
+    except CS2POVError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Preprocess for timeline data (per-player)
+    player_timelines: dict[int, DemoTimeline] = {}
+    for player in demo_info.players:
         try:
-            demo_info = parse_demo(args.demo)
-            print(f"Demo: {args.demo.name}")
-            print_demo_info(demo_info)
-            return 0
-        except CS2POVError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+            timeline = preprocess_demo(demo_path, player.steamid, player.name)
+            player_timelines[player.steamid] = timeline
+        except Exception:
+            pass
 
+    if args.json:
+        output = format_info_json(demo_info, player_timelines)
+        print(json.dumps(output, indent=2))
+    else:
+        print_demo_info_extended(demo_info, player_timelines, verbose=args.verbose)
+
+    return 0
+
+
+def cmd_pov(args) -> int:
+    """Handle 'pov' command - full recording pipeline."""
     # Check dependencies
     missing = check_dependencies()
     if missing:
@@ -481,10 +725,8 @@ Examples:
     # Validate inputs
     demo_path = args.demo.resolve()
     if not demo_path.exists():
-        print(f"Error: Demo file not found: {demo_path}", file=sys.stderr)
+        print(f"Error: Demo not found: {demo_path}", file=sys.stderr)
         return 1
-
-    output_path = args.output.resolve()
 
     try:
         resolution = parse_resolution(args.resolution)
@@ -492,51 +734,24 @@ Examples:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # Handle --skip-recording mode
-    if args.skip_recording:
-        if not args.console_log:
-            print("Error: --skip-recording requires --console-log", file=sys.stderr)
-            return 1
-        if args.player_slot is None:
-            print("Error: --skip-recording requires --player-slot", file=sys.stderr)
-            return 1
-        if args.recording_start_time is None:
-            print("Error: --skip-recording requires --recording-start-time", file=sys.stderr)
-            return 1
-        if not output_path.exists():
-            print(f"Error: Video file not found: {output_path}", file=sys.stderr)
-            return 1
+    output_path = args.output.resolve()
 
-        print("Post-processing only (--skip-recording mode)")
-        postprocess_video(
-            video_path=output_path,
-            console_log_path=args.console_log.resolve(),
-            player_slot=args.player_slot,
-            recording_start_time=args.recording_start_time,
-            verbose=args.verbose,
-        )
-        return 0
+    # Record
+    result = record_demo(
+        demo_path=demo_path,
+        player_identifier=args.player,
+        output_path=output_path,
+        resolution=resolution,
+        framerate=args.framerate,
+        hide_hud=args.no_hud,
+        display_num=args.display,
+        verbose=args.verbose,
+        cs2_path_override=args.cs2_path,
+        enable_audio=not args.no_audio,
+        audio_device=args.audio_device,
+    )
 
-    # Phase 1-3: Record (with built-in cleanup)
-    try:
-        result = record_demo(
-            demo_path=demo_path,
-            player_identifier=args.player,
-            output_path=output_path,
-            resolution=resolution,
-            framerate=args.framerate,
-            hide_hud=args.no_hud,
-            display_num=args.display,
-            verbose=args.verbose,
-            cs2_path_override=args.cs2_path,
-            enable_audio=not args.no_audio,
-            audio_device=args.audio_device,
-        )
-    except CS2POVError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-    # Phase 4: Post-process (completely separate)
+    # Post-process
     if result.success and not args.no_trim:
         postprocess_video(
             video_path=result.video_path,
@@ -544,6 +759,7 @@ Examples:
             player_slot=result.player_slot,
             recording_start_time=result.recording_start_time,
             verbose=args.verbose,
+            timeline=result.timeline,
         )
     elif result.success:
         size_mb = result.video_path.stat().st_size / (1024 * 1024)
@@ -555,6 +771,154 @@ Examples:
             print(f"Partial recording available: {result.video_path} ({size_mb:.1f} MB)")
 
     return 0 if result.success else 1
+
+
+def cmd_record(args) -> int:
+    """Handle 'record' command - raw recording without trimming."""
+    # Check dependencies
+    missing = check_dependencies()
+    if missing:
+        print("Missing dependencies:", file=sys.stderr)
+        for dep in missing:
+            print(f"  - {dep}", file=sys.stderr)
+        return 1
+
+    # Validate inputs
+    demo_path = args.demo.resolve()
+    if not demo_path.exists():
+        print(f"Error: Demo not found: {demo_path}", file=sys.stderr)
+        return 1
+
+    try:
+        resolution = parse_resolution(args.resolution)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    output_path = args.output.resolve()
+
+    # Record only
+    result = record_demo(
+        demo_path=demo_path,
+        player_identifier=args.player,
+        output_path=output_path,
+        resolution=resolution,
+        framerate=args.framerate,
+        hide_hud=args.no_hud,
+        display_num=args.display,
+        verbose=args.verbose,
+        cs2_path_override=args.cs2_path,
+        enable_audio=not args.no_audio,
+        audio_device=args.audio_device,
+    )
+
+    if result.success:
+        size_mb = result.video_path.stat().st_size / (1024 * 1024)
+        print(f"\nRaw recording saved: {result.video_path} ({size_mb:.1f} MB)")
+        print(f"\nTo trim later, run:")
+        print(f"  cs2pov trim \"{result.video_path}\" -d \"{demo_path}\" -p \"{args.player}\"")
+    else:
+        print(f"\nRecording ended with: {result.exit_reason}")
+        if result.video_path.exists():
+            size_mb = result.video_path.stat().st_size / (1024 * 1024)
+            print(f"Partial recording available: {result.video_path} ({size_mb:.1f} MB)")
+
+    return 0 if result.success else 1
+
+
+def cmd_trim(args) -> int:
+    """Handle 'trim' command - post-process existing video."""
+    video_path = args.video.resolve()
+    if not video_path.exists():
+        print(f"Error: Video not found: {video_path}", file=sys.stderr)
+        return 1
+
+    demo_path = args.demo.resolve()
+    if not demo_path.exists():
+        print(f"Error: Demo not found: {demo_path}", file=sys.stderr)
+        return 1
+
+    # Determine output path
+    if args.output:
+        output_path = args.output.resolve()
+    else:
+        output_path = video_path.parent / f"{video_path.stem}_trimmed{video_path.suffix}"
+
+    # Parse demo and find player
+    try:
+        demo_info = parse_demo(demo_path)
+        player = find_player(demo_info, args.player)
+        player_slot = get_player_index(demo_info, player)
+    except CS2POVError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Get timeline from demo
+    timeline = None
+    try:
+        timeline = preprocess_demo(demo_path, player.steamid, player.name)
+        print(f"Using demo timeline: {len(timeline.deaths)} deaths, {len(timeline.spawns)} spawns")
+    except Exception as e:
+        print(f"Warning: Could not preprocess demo: {e}")
+        print("Falling back to console.log method")
+
+    # Validate fallback parameters if needed
+    if timeline is None:
+        if args.console_log is None:
+            print("Error: --console-log required when demo preprocessing fails", file=sys.stderr)
+            return 1
+        if args.player_slot is None:
+            print("Error: --player-slot required when demo preprocessing fails", file=sys.stderr)
+            return 1
+        if args.recording_start_time is None:
+            print("Error: --recording-start-time required when demo preprocessing fails", file=sys.stderr)
+            return 1
+        player_slot = args.player_slot
+
+    # Copy video to output path first (postprocess_video expects to rename)
+    if video_path != output_path:
+        shutil.copy2(video_path, output_path)
+
+    # Run trimming
+    postprocess_video(
+        video_path=output_path,
+        console_log_path=args.console_log.resolve() if args.console_log else Path("/dev/null"),
+        player_slot=player_slot,
+        recording_start_time=args.recording_start_time or 0.0,
+        verbose=args.verbose,
+        timeline=timeline,
+    )
+
+    return 0
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+def main() -> int:
+    """Main entry point."""
+    parser = create_parser()
+    args = parser.parse_args()
+
+    try:
+        if args.command == "info":
+            return cmd_info(args)
+        elif args.command == "pov":
+            return cmd_pov(args)
+        elif args.command == "record":
+            return cmd_record(args)
+        elif args.command == "trim":
+            return cmd_trim(args)
+        else:
+            parser.print_help()
+            return 1
+    except CS2POVError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

@@ -6,9 +6,12 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .exceptions import CaptureError
+
+if TYPE_CHECKING:
+    from .preprocessor import DemoTimeline
 
 
 @dataclass
@@ -20,6 +23,17 @@ class DeathPeriod:
     @property
     def duration(self) -> float:
         return self.respawn_time - self.death_time
+
+
+@dataclass
+class TrimPeriod:
+    """A period to trim from the video."""
+    start_time: float  # Video timestamp in seconds
+    end_time: float  # Video timestamp in seconds
+
+    @property
+    def duration(self) -> float:
+        return self.end_time - self.start_time
 
 
 def parse_log_timestamp(timestamp_str: str, reference_date: Optional[datetime] = None) -> datetime:
@@ -340,3 +354,74 @@ def trim_death_periods(
             print(f"    [Trim] Output video: {output_duration:.2f}s")
 
     return True
+
+
+def get_trim_periods_from_timeline(
+    timeline: "DemoTimeline",
+    first_spawn_video_time: float,
+    verbose: bool = False,
+) -> list[TrimPeriod]:
+    """Get trim periods from preprocessed timeline data.
+
+    Uses the timeline's death/spawn events to compute trim periods.
+    The first_spawn_video_time parameter tells us when the first spawn
+    occurred in the video, allowing us to align demo times with video times.
+
+    Args:
+        timeline: Preprocessed DemoTimeline with death/spawn events
+        first_spawn_video_time: Video timestamp when first spawn occurred
+        verbose: Print debug output
+
+    Returns:
+        List of TrimPeriod objects with video-relative timestamps
+    """
+    from .preprocessor import get_trim_periods_for_video
+
+    trim_periods = []
+
+    # Get demo-relative trim periods and convert to video-relative
+    video_periods = get_trim_periods_for_video(timeline, first_spawn_video_time)
+
+    for start, end in video_periods:
+        trim_periods.append(TrimPeriod(start_time=start, end_time=end))
+        if verbose:
+            print(f"    [Trim] Period: {start:.2f}s - {end:.2f}s ({end - start:.2f}s)")
+
+    if verbose:
+        print(f"    [Trim] Found {len(trim_periods)} periods to trim from timeline")
+
+    return trim_periods
+
+
+def trim_video_with_periods(
+    input_path: Path,
+    output_path: Path,
+    trim_periods: list[TrimPeriod],
+    verbose: bool = False,
+) -> bool:
+    """Trim specified periods from video using FFmpeg concat demuxer.
+
+    This is a generalized version that takes TrimPeriod objects directly.
+    Creates segments for periods to keep and concatenates them.
+
+    Args:
+        input_path: Path to input video
+        output_path: Path for output video
+        trim_periods: List of periods to remove from video
+        verbose: Print debug output
+
+    Returns:
+        True if trimming was performed, False if no trimming needed
+    """
+    if not trim_periods:
+        if verbose:
+            print("    [Trim] No periods to trim")
+        return False
+
+    # Convert TrimPeriod to DeathPeriod for compatibility with existing logic
+    death_periods = [
+        DeathPeriod(death_time=p.start_time, respawn_time=p.end_time)
+        for p in trim_periods
+    ]
+
+    return trim_death_periods(input_path, output_path, death_periods, verbose)
