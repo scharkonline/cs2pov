@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
-from .automation import send_key, check_demo_ended, wait_for_cs2_window, wait_for_first_spawn
+from .automation import send_key, check_demo_ended, wait_for_cs2_window, wait_for_demo_ready, parse_demo_end_info
 from .capture import FFmpegCapture, get_default_audio_monitor
 from .config import RecordingConfig, generate_recording_cfg
 from .exceptions import CS2POVError
@@ -255,20 +255,20 @@ def record_demo(
         else:
             print("  Warning: CS2 window not detected, continuing anyway")
 
-        # Wait for first player spawn
-        print(f"  Waiting for first spawn ({player.name})...")
-        if wait_for_first_spawn(console_log_path, player.name, timeout=180):
-            print("  First spawn detected")
+        # Wait for demo to be ready
+        print("  Waiting for demo to load...")
+        if wait_for_demo_ready(console_log_path, timeout=180):
+            print("  Demo ready")
             if verbose:
-                print("  Waiting 15s for game to stabilize...")
-            time.sleep(15)
+                print("  Waiting 10s before hiding demo UI...")
+            time.sleep(10)
             if window_id and send_key("shift+F2", display_str, window_id):
                 if verbose:
                     print("  Sent Shift+F2 to hide demo UI")
             elif window_id:
                 print("  Warning: Failed to send Shift+F2 to hide demo UI")
         else:
-            print("  Warning: First spawn not detected, continuing anyway")
+            print("  Warning: Demo ready state not detected, continuing anyway")
 
         # Determine audio source
         audio_source = None
@@ -355,7 +355,16 @@ def postprocess_video(
     verbose: bool = False,
     timeline: Optional[DemoTimeline] = None,
 ) -> Path:
-    """Post-process a recorded video to trim death periods."""
+    """Post-process a recorded video to trim death periods.
+
+    Process:
+    1. Calculate startup_time = video_duration - demo_duration
+    2. Trim startup from beginning (aligns video with demo time 0)
+    3. Convert death periods from ticks to seconds (demo time)
+    4. Apply death period trims (times are now aligned with truncated video)
+    """
+    from .trim import get_video_duration
+
     if not video_path.exists():
         print(f"Error: Video file not found: {video_path}")
         return video_path
@@ -363,7 +372,7 @@ def postprocess_video(
     raw_size_mb = video_path.stat().st_size / (1024 * 1024)
     print(f"\nRaw recording: {video_path} ({raw_size_mb:.1f} MB)")
 
-    print("\nPost-processing: extracting trim periods...")
+    print("\nPost-processing: calculating trim periods...")
 
     trim_periods: list[TrimPeriod] = []
 
@@ -372,14 +381,88 @@ def postprocess_video(
         print("  Using preprocessed timeline data (demoparser2)")
         if verbose:
             print(f"  Deaths: {len(timeline.deaths)}, Spawns: {len(timeline.spawns)}")
+            print(f"  Tickrate: {timeline.tickrate}, Total ticks: {timeline.total_ticks}")
 
-        demo_trim_periods = get_trim_periods(timeline)
+        # Step 1: Get video duration and demo duration
+        try:
+            video_duration = get_video_duration(video_path)
+        except Exception as e:
+            print(f"  Error getting video duration: {e}")
+            print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
+            return video_path
 
-        if demo_trim_periods:
-            for start, end in demo_trim_periods:
-                trim_periods.append(TrimPeriod(start_time=start, end_time=end))
+        # Get demo duration - try multiple sources
+        demo_duration = 0.0
+
+        # Method 1: From console.log demo end marker (most accurate)
+        demo_end_info = parse_demo_end_info(console_log_path)
+        if demo_end_info and timeline.tickrate > 0:
+            demo_duration = demo_end_info.tick / timeline.tickrate
+            if verbose:
+                print(f"  Demo duration source: console.log end marker")
+
+        # Method 2: From timeline total_duration (from demo header)
+        if demo_duration == 0.0 and timeline.total_duration > 0:
+            demo_duration = timeline.total_duration
+            if verbose:
+                print(f"  Demo duration source: demo header")
+
+        # Method 3: Calculate from last event in timeline
+        if demo_duration == 0.0 and timeline.tickrate > 0:
+            max_tick = 0
+            for spawn in timeline.spawns:
+                max_tick = max(max_tick, spawn.tick)
+            for death in timeline.deaths:
+                max_tick = max(max_tick, death.tick)
+            if max_tick > 0:
+                # Add a buffer since last event isn't necessarily demo end
+                demo_duration = (max_tick / timeline.tickrate) + 60.0
                 if verbose:
-                    print(f"    Period: {start:.2f}s - {end:.2f}s ({end - start:.2f}s)")
+                    print(f"  Demo duration source: last event tick + 60s buffer")
+
+        if verbose:
+            print(f"  Video duration: {video_duration:.2f}s")
+            print(f"  Demo duration: {demo_duration:.2f}s")
+
+        if demo_duration == 0.0:
+            print("  Error: Could not determine demo duration")
+            print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
+            return video_path
+
+        # Step 2: Calculate startup time (recording before demo started)
+        startup_time = video_duration - demo_duration
+        if startup_time < 0:
+            print(f"  Warning: Negative startup time ({startup_time:.2f}s), using 0")
+            startup_time = 0.0
+
+        if verbose:
+            print(f"  Startup time (to trim): {startup_time:.2f}s")
+
+        # Step 3: Build trim periods
+        # First: trim from 0 to (startup_time + first_spawn_time)
+        # This removes the recording startup AND the demo freeze/warmup time
+        first_spawn_time = timeline.spawns[0].time_seconds if timeline.spawns else 0.0
+        initial_trim_end = startup_time + first_spawn_time
+
+        if initial_trim_end > 0.5:  # Only trim if > 0.5s
+            trim_periods.append(TrimPeriod(start_time=0.0, end_time=initial_trim_end))
+            if verbose:
+                print(f"  Initial trim: 0.00s - {initial_trim_end:.2f}s (startup + freeze)")
+
+        # Step 4: Add death periods (convert demo ticks to video time)
+        # video_time = startup_time + demo_time
+        for death_period in timeline.death_periods:
+            death_video_time = startup_time + death_period.death.time_seconds
+            respawn_video_time = startup_time + death_period.spawn.time_seconds
+
+            # Only include if after the initial trim
+            if respawn_video_time > initial_trim_end:
+                # Adjust start if it overlaps with initial trim
+                death_video_time = max(death_video_time, initial_trim_end)
+                trim_periods.append(TrimPeriod(start_time=death_video_time, end_time=respawn_video_time))
+                if verbose:
+                    duration = respawn_video_time - death_video_time
+                    print(f"  Death period: {death_video_time:.2f}s - {respawn_video_time:.2f}s ({duration:.2f}s)")
 
     # Fall back to console.log parsing
     if not trim_periods:

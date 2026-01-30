@@ -105,10 +105,12 @@ class FFmpegCapture:
             ])
 
         # Video encoding settings
+        # Use ultrafast preset for real-time capture to minimize CPU load
+        # CRF 23 is default quality - good balance for gameplay recording
         cmd.extend([
             "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
+            "-preset", "ultrafast",
+            "-crf", "23",
             "-pix_fmt", "yuv420p",
             "-g", str(self.framerate * 2),  # Keyframe every 2 seconds
         ])

@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -105,6 +106,54 @@ def check_demo_ended(log_path: Path, last_position: int = 0) -> tuple[bool, int]
         return False, last_position
 
 
+@dataclass
+class DemoEndInfo:
+    """Information about when the demo ended."""
+    tick: int
+    timestamp: float  # Unix timestamp from console.log
+
+
+def parse_demo_end_info(log_path: Path) -> Optional[DemoEndInfo]:
+    """Parse demo end information from console.log.
+
+    Extracts the tick number and timestamp from:
+    MM/DD HH:mm:ss CGameRules - paused on tick <tick>
+
+    Args:
+        log_path: Path to console.log file
+
+    Returns:
+        DemoEndInfo with tick and timestamp, or None if not found
+    """
+    from datetime import datetime
+
+    if not log_path.exists():
+        return None
+
+    # Pattern: MM/DD HH:mm:ss CGameRules - paused on tick <number>
+    demo_end_pattern = re.compile(
+        r"^(\d{2}/\d{2} \d{2}:\d{2}:\d{2}).*CGameRules - paused on tick (\d+)"
+    )
+
+    try:
+        with open(log_path, 'r', errors='ignore') as f:
+            for line in f:
+                match = demo_end_pattern.match(line)
+                if match:
+                    timestamp_str = match.group(1)
+                    tick = int(match.group(2))
+
+                    # Parse timestamp (MM/DD HH:mm:ss) - assume current year
+                    parsed = datetime.strptime(timestamp_str, "%m/%d %H:%M:%S")
+                    parsed = parsed.replace(year=datetime.now().year)
+
+                    return DemoEndInfo(tick=tick, timestamp=parsed.timestamp())
+    except Exception:
+        pass
+
+    return None
+
+
 def wait_for_map_load(log_path: Path, timeout: float = 120, poll_interval: float = 0.5) -> bool:
     """Wait for map to finish loading by watching console.log.
 
@@ -145,31 +194,29 @@ def wait_for_map_load(log_path: Path, timeout: float = 120, poll_interval: float
     return False
 
 
-def wait_for_first_spawn(
+def wait_for_demo_ready(
     log_path: Path,
-    player_name: str,
     timeout: float = 180,
     poll_interval: float = 0.5
 ) -> bool:
-    """Wait for first spawn of the target player by watching console.log.
+    """Wait for demo to be ready by watching console.log.
 
-    Looks for: <player> spawned
+    Looks for: [HostStateManager] Host activate: Playing Demo
 
-    This indicates the player has spawned and the POV camera is ready.
+    This indicates the demo has loaded and playback is starting.
 
     Args:
         log_path: Path to CS2 console.log
-        player_name: Name of the player to watch for
         timeout: Maximum time to wait in seconds
         poll_interval: Time between checks
 
     Returns:
-        True if first spawn detected, False if timeout
+        True if ready state detected, False if timeout
     """
     import time
 
-    spawn_pattern = re.compile(
-            rf"{re.escape(player_name)} spawned\b"
+    ready_pattern = re.compile(
+        r"\[HostStateManager\] Host activate: Playing Demo"
     )
     start = time.time()
     last_position = 0
@@ -185,7 +232,7 @@ def wait_for_first_spawn(
                 content = f.read()
                 last_position = f.tell()
 
-                if spawn_pattern.search(content):
+                if ready_pattern.search(content):
                     return True
         except Exception:
             pass
