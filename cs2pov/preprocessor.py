@@ -213,10 +213,14 @@ def _extract_deaths(parser: DemoParser, player_steamid: int, tickrate: float) ->
             time_seconds = tick / tickrate if tickrate > 0 else 0
 
             # Extract optional fields
+            # Note: NaN values from pandas need special handling (NaN is not None, and NaN != 0)
             attacker_steamid = row.get("attacker_steamid")
-            if attacker_steamid is not None and attacker_steamid != 0:
-                attacker_steamid = int(attacker_steamid)
-            else:
+            try:
+                if attacker_steamid is not None and attacker_steamid == attacker_steamid and attacker_steamid != 0:
+                    attacker_steamid = int(attacker_steamid)
+                else:
+                    attacker_steamid = None
+            except (ValueError, TypeError):
                 attacker_steamid = None
 
             weapon = row.get("weapon")
@@ -553,10 +557,11 @@ def compute_alive_segments(
             else:
                 round_end_tick = total_ticks
 
-        # Find first death in this round (between freeze_end and round_end)
+        # Find first death in this round (between freeze_end and round_end, inclusive)
+        # Note: Use <= for round_end to catch bomb kills that happen exactly at round end
         death_in_round = None
         for death in deaths:
-            if round_start_tick <= death.tick < round_end_tick:
+            if round_start_tick <= death.tick <= round_end_tick:
                 death_in_round = death
                 break
 
