@@ -77,6 +77,24 @@ class RoundEndPeriod:
 
 
 @dataclass
+class AliveSegment:
+    """A period when the player is alive and gameplay should be shown.
+
+    Times are demo-relative (tick 0 = demo start).
+    """
+    start_tick: int
+    end_tick: int
+    start_time: float  # seconds from demo start
+    end_time: float    # seconds from demo start
+    round_num: int     # 0 for pre-round segment
+    reason_ended: str  # "death", "round_end", "demo_end"
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.end_time - self.start_time
+
+
+@dataclass
 class DemoTimeline:
     """Complete timeline data for a player in a demo."""
 
@@ -88,8 +106,11 @@ class DemoTimeline:
 
     deaths: list[DeathEvent] = field(default_factory=list)
     spawns: list[SpawnEvent] = field(default_factory=list)
-    death_periods: list[DeathPeriod] = field(default_factory=list)
     rounds: list[RoundBoundary] = field(default_factory=list)
+    alive_segments: list[AliveSegment] = field(default_factory=list)
+
+    # Deprecated - kept for backward compatibility during transition
+    death_periods: list[DeathPeriod] = field(default_factory=list)
     round_end_periods: list[RoundEndPeriod] = field(default_factory=list)
 
 
@@ -134,16 +155,21 @@ def preprocess_demo(demo_path: Path, player_steamid: int, player_name: str = "")
         # Extract round boundaries
         rounds = _extract_round_boundaries(parser, tickrate)
 
-        # Compute death periods using rounds (death -> 5s before next round freeze_end)
-        # This is more reliable than spawn events
-        death_periods = compute_death_periods_from_rounds(deaths, rounds, tickrate, buffer_seconds=5.0)
+        # Compute alive segments (new unified approach)
+        # This replaces the separate death_periods and round_end_periods logic
+        alive_segments = compute_alive_segments(
+            deaths=deaths,
+            rounds=rounds,
+            tickrate=tickrate,
+            total_ticks=total_ticks,
+            buffer_before_round=5.0,
+            buffer_after_round_end=2.0,
+        )
 
-        # Fallback to spawn-based if rounds didn't work
+        # Deprecated: still compute these for backward compatibility
+        death_periods = compute_death_periods_from_rounds(deaths, rounds, tickrate, buffer_seconds=5.0)
         if not death_periods and deaths and spawns:
             death_periods = compute_death_periods(deaths, spawns)
-
-        # Compute round end periods (round_end -> 5s before next round freeze_end)
-        # This trims dead time between rounds when the player survives
         round_end_periods = compute_round_end_periods(rounds, tickrate, buffer_before_next=5.0, buffer_after_end=2.0)
 
         return DemoTimeline(
@@ -154,8 +180,10 @@ def preprocess_demo(demo_path: Path, player_steamid: int, player_name: str = "")
             total_duration=total_duration,
             deaths=deaths,
             spawns=spawns,
-            death_periods=death_periods,
             rounds=rounds,
+            alive_segments=alive_segments,
+            # Deprecated fields (kept for backward compatibility)
+            death_periods=death_periods,
             round_end_periods=round_end_periods,
         )
 
@@ -460,6 +488,134 @@ def compute_round_end_periods(
             ))
 
     return round_end_periods
+
+
+def compute_alive_segments(
+    deaths: list[DeathEvent],
+    rounds: list[RoundBoundary],
+    tickrate: float,
+    total_ticks: int,
+    buffer_before_round: float = 5.0,
+    buffer_after_round_end: float = 2.0,
+) -> list[AliveSegment]:
+    """Compute alive segments from deaths and round boundaries.
+
+    An "alive segment" is a period when the player is alive and actively
+    in gameplay. This replaces the separate death_periods and round_end_periods
+    with a unified approach.
+
+    For each round:
+    - Segment starts at (freeze_end - buffer_before_round)
+    - Segment ends at (player death) OR (round_end + buffer_after_round_end),
+      whichever comes first
+
+    This naturally handles both death and survival cases.
+
+    Args:
+        deaths: List of death events, sorted by tick
+        rounds: List of round boundaries, sorted by round_num
+        tickrate: Demo tickrate for time calculations
+        total_ticks: Total demo ticks (for last segment)
+        buffer_before_round: Seconds before freeze_end to start segment (default 5s)
+        buffer_after_round_end: Seconds after round_end to show (default 2s)
+
+    Returns:
+        List of AliveSegment objects, sorted by start_tick
+    """
+    if not rounds:
+        return []
+
+    alive_segments = []
+    buffer_before_ticks = int(buffer_before_round * tickrate)
+    buffer_after_ticks = int(buffer_after_round_end * tickrate)
+
+    # Create a set of death ticks for quick lookup
+    death_ticks = {d.tick: d for d in deaths}
+
+    for i, r in enumerate(rounds):
+        # Determine segment start: freeze_end - buffer (or prestart if no freeze_end)
+        if r.freeze_end_tick is not None:
+            segment_start_tick = r.freeze_end_tick - buffer_before_ticks
+        else:
+            # Fallback: use prestart + estimated freeze time (~15s)
+            segment_start_tick = r.prestart_tick + int(15.0 * tickrate) - buffer_before_ticks
+
+        segment_start_tick = max(0, segment_start_tick)  # Clamp to demo start
+
+        # Determine round boundaries for finding deaths
+        round_start_tick = r.freeze_end_tick if r.freeze_end_tick else r.prestart_tick
+        round_end_tick = r.end_tick
+
+        # If no round end, use next round's prestart or total_ticks
+        if round_end_tick is None:
+            if i + 1 < len(rounds):
+                round_end_tick = rounds[i + 1].prestart_tick
+            else:
+                round_end_tick = total_ticks
+
+        # Find first death in this round (between freeze_end and round_end)
+        death_in_round = None
+        for death in deaths:
+            if round_start_tick <= death.tick < round_end_tick:
+                death_in_round = death
+                break
+
+        # Determine segment end
+        if death_in_round:
+            segment_end_tick = death_in_round.tick
+            reason = "death"
+        elif r.end_tick is not None:
+            segment_end_tick = r.end_tick + buffer_after_ticks
+            reason = "round_end"
+        else:
+            segment_end_tick = round_end_tick
+            reason = "demo_end"
+
+        # Create segment if valid (end > start)
+        if segment_end_tick > segment_start_tick:
+            alive_segments.append(AliveSegment(
+                start_tick=segment_start_tick,
+                end_tick=segment_end_tick,
+                start_time=segment_start_tick / tickrate,
+                end_time=segment_end_tick / tickrate,
+                round_num=r.round_num,
+                reason_ended=reason,
+            ))
+
+    # Merge overlapping segments
+    return _merge_alive_segments(alive_segments)
+
+
+def _merge_alive_segments(segments: list[AliveSegment]) -> list[AliveSegment]:
+    """Merge overlapping or adjacent alive segments."""
+    if not segments:
+        return []
+
+    # Sort by start tick
+    sorted_segments = sorted(segments, key=lambda s: s.start_tick)
+    merged = [sorted_segments[0]]
+
+    for current in sorted_segments[1:]:
+        prev = merged[-1]
+
+        # Check if current overlaps or is adjacent to previous
+        if current.start_tick <= prev.end_tick:
+            # Extend previous segment if current ends later
+            if current.end_tick > prev.end_tick:
+                # Create new merged segment
+                merged[-1] = AliveSegment(
+                    start_tick=prev.start_tick,
+                    end_tick=current.end_tick,
+                    start_time=prev.start_time,
+                    end_time=current.end_time,
+                    round_num=prev.round_num,  # Keep first round's number
+                    reason_ended=current.reason_ended,  # Use later reason
+                )
+        else:
+            # No overlap, add as new segment
+            merged.append(current)
+
+    return merged
 
 
 def get_trim_periods(timeline: DemoTimeline) -> list[tuple[float, float]]:
