@@ -850,39 +850,40 @@ def cmd_pov(args) -> int:
 
     output_path = args.output.resolve()
 
-    # Record
-    result = record_demo(
-        demo_path=demo_path,
-        player_identifier=args.player,
-        output_path=output_path,
-        resolution=resolution,
-        framerate=args.framerate,
-        hide_hud=args.no_hud,
-        display_num=args.display,
-        verbose=args.verbose,
-        cs2_path_override=args.cs2_path,
-        enable_audio=not args.no_audio,
-        audio_device=args.audio_device,
-    )
-
-    # Post-process
-    if result.success and not args.no_trim:
-        postprocess_video(
-            video_path=result.video_path,
-            console_log_path=result.console_log_path,
-            player_slot=result.player_slot,
-            recording_start_time=result.recording_start_time,
+    with LoadingAnimation():
+        # Record
+        result = record_demo(
+            demo_path=demo_path,
+            player_identifier=args.player,
+            output_path=output_path,
+            resolution=resolution,
+            framerate=args.framerate,
+            hide_hud=args.no_hud,
+            display_num=args.display,
             verbose=args.verbose,
-            timeline=result.timeline,
+            cs2_path_override=args.cs2_path,
+            enable_audio=not args.no_audio,
+            audio_device=args.audio_device,
         )
-    elif result.success:
-        size_mb = result.video_path.stat().st_size / (1024 * 1024)
-        print(f"\nRecording saved: {result.video_path} ({size_mb:.1f} MB)")
-    else:
-        print(f"\nRecording ended with: {result.exit_reason}")
-        if result.video_path.exists():
+
+        # Post-process
+        if result.success and not args.no_trim:
+            postprocess_video(
+                video_path=result.video_path,
+                console_log_path=result.console_log_path,
+                player_slot=result.player_slot,
+                recording_start_time=result.recording_start_time,
+                verbose=args.verbose,
+                timeline=result.timeline,
+            )
+        elif result.success:
             size_mb = result.video_path.stat().st_size / (1024 * 1024)
-            print(f"Partial recording available: {result.video_path} ({size_mb:.1f} MB)")
+            print(f"\nRecording saved: {result.video_path} ({size_mb:.1f} MB)")
+        else:
+            print(f"\nRecording ended with: {result.exit_reason}")
+            if result.video_path.exists():
+                size_mb = result.video_path.stat().st_size / (1024 * 1024)
+                print(f"Partial recording available: {result.video_path} ({size_mb:.1f} MB)")
 
     return 0 if result.success else 1
 
@@ -911,31 +912,32 @@ def cmd_record(args) -> int:
 
     output_path = args.output.resolve()
 
-    # Record only
-    result = record_demo(
-        demo_path=demo_path,
-        player_identifier=args.player,
-        output_path=output_path,
-        resolution=resolution,
-        framerate=args.framerate,
-        hide_hud=args.no_hud,
-        display_num=args.display,
-        verbose=args.verbose,
-        cs2_path_override=args.cs2_path,
-        enable_audio=not args.no_audio,
-        audio_device=args.audio_device,
-    )
+    with LoadingAnimation():
+        # Record only
+        result = record_demo(
+            demo_path=demo_path,
+            player_identifier=args.player,
+            output_path=output_path,
+            resolution=resolution,
+            framerate=args.framerate,
+            hide_hud=args.no_hud,
+            display_num=args.display,
+            verbose=args.verbose,
+            cs2_path_override=args.cs2_path,
+            enable_audio=not args.no_audio,
+            audio_device=args.audio_device,
+        )
 
-    if result.success:
-        size_mb = result.video_path.stat().st_size / (1024 * 1024)
-        print(f"\nRaw recording saved: {result.video_path} ({size_mb:.1f} MB)")
-        print(f"\nTo trim later, run:")
-        print(f"  cs2pov trim \"{result.video_path}\" -d \"{demo_path}\" -p \"{args.player}\"")
-    else:
-        print(f"\nRecording ended with: {result.exit_reason}")
-        if result.video_path.exists():
+        if result.success:
             size_mb = result.video_path.stat().st_size / (1024 * 1024)
-            print(f"Partial recording available: {result.video_path} ({size_mb:.1f} MB)")
+            print(f"\nRaw recording saved: {result.video_path} ({size_mb:.1f} MB)")
+            print(f"\nTo trim later, run:")
+            print(f"  cs2pov trim \"{result.video_path}\" -d \"{demo_path}\" -p \"{args.player}\"")
+        else:
+            print(f"\nRecording ended with: {result.exit_reason}")
+            if result.video_path.exists():
+                size_mb = result.video_path.stat().st_size / (1024 * 1024)
+                print(f"Partial recording available: {result.video_path} ({size_mb:.1f} MB)")
 
     return 0 if result.success else 1
 
@@ -958,52 +960,53 @@ def cmd_trim(args) -> int:
     else:
         output_path = video_path.parent / f"{video_path.stem}_trimmed{video_path.suffix}"
 
-    # Parse demo and find player
-    try:
-        demo_info = parse_demo(demo_path)
-        player = find_player(demo_info, args.player)
-        player_slot = get_player_index(demo_info, player)
-    except CS2POVError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-    # Get timeline from demo
-    timeline = None
-    try:
-        timeline = preprocess_demo(demo_path, player.steamid, player.name)
-        print(f"Using demo timeline: {len(timeline.deaths)} deaths, {len(timeline.rounds)} rounds")
-        print(f"  {len(timeline.alive_segments)} alive segments to keep")
-    except Exception as e:
-        print(f"Warning: Could not preprocess demo: {e}")
-        print("Falling back to console.log method")
-
-    # Validate fallback parameters if needed
-    if timeline is None:
-        if args.console_log is None:
-            print("Error: --console-log required when demo preprocessing fails", file=sys.stderr)
+    with LoadingAnimation():
+        # Parse demo and find player
+        try:
+            demo_info = parse_demo(demo_path)
+            player = find_player(demo_info, args.player)
+            player_slot = get_player_index(demo_info, player)
+        except CS2POVError as e:
+            print(f"Error: {e}", file=sys.stderr)
             return 1
-        if args.player_slot is None:
-            print("Error: --player-slot required when demo preprocessing fails", file=sys.stderr)
-            return 1
-        if args.recording_start_time is None:
-            print("Error: --recording-start-time required when demo preprocessing fails", file=sys.stderr)
-            return 1
-        player_slot = args.player_slot
 
-    # Copy video to output path first (postprocess_video expects to rename)
-    if video_path != output_path:
-        shutil.copy2(video_path, output_path)
+        # Get timeline from demo
+        timeline = None
+        try:
+            timeline = preprocess_demo(demo_path, player.steamid, player.name)
+            print(f"Using demo timeline: {len(timeline.deaths)} deaths, {len(timeline.rounds)} rounds")
+            print(f"  {len(timeline.alive_segments)} alive segments to keep")
+        except Exception as e:
+            print(f"Warning: Could not preprocess demo: {e}")
+            print("Falling back to console.log method")
 
-    # Run trimming
-    postprocess_video(
-        video_path=output_path,
-        console_log_path=args.console_log.resolve() if args.console_log else Path("/dev/null"),
-        player_slot=player_slot,
-        recording_start_time=args.recording_start_time or 0.0,
-        verbose=args.verbose,
-        timeline=timeline,
-        startup_time_override=args.startup_time,
-    )
+        # Validate fallback parameters if needed
+        if timeline is None:
+            if args.console_log is None:
+                print("Error: --console-log required when demo preprocessing fails", file=sys.stderr)
+                return 1
+            if args.player_slot is None:
+                print("Error: --player-slot required when demo preprocessing fails", file=sys.stderr)
+                return 1
+            if args.recording_start_time is None:
+                print("Error: --recording-start-time required when demo preprocessing fails", file=sys.stderr)
+                return 1
+            player_slot = args.player_slot
+
+        # Copy video to output path first (postprocess_video expects to rename)
+        if video_path != output_path:
+            shutil.copy2(video_path, output_path)
+
+        # Run trimming
+        postprocess_video(
+            video_path=output_path,
+            console_log_path=args.console_log.resolve() if args.console_log else Path("/dev/null"),
+            player_slot=player_slot,
+            recording_start_time=args.recording_start_time or 0.0,
+            verbose=args.verbose,
+            timeline=timeline,
+            startup_time_override=args.startup_time,
+        )
 
     return 0
 
