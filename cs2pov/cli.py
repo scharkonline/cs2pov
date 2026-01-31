@@ -597,17 +597,15 @@ def print_demo_info_extended(
 
     print(f"\nPlayers ({len(demo_info.players)}):")
     for player in demo_info.players:
-        team_str = f"[{player.team}]" if player.team else "[--]"
         timeline = timelines.get(player.steamid)
 
         print(f"  {player.name}")
-        print(f"    SteamID: {player.steamid}  Team: {team_str}")
+        print(f"    SteamID: {player.steamid}")
+        print(f"    Kills: {player.kills}  Deaths: {len(timeline.deaths) if timeline else 0}  Assists: {player.assists}")
 
         if timeline:
-            death_count = len(timeline.deaths)
             alive_time = sum(seg.duration_seconds for seg in timeline.alive_segments)
-            print(f"    Deaths: {death_count}, Alive segments: {len(timeline.alive_segments)}, "
-                  f"Alive time: {alive_time:.1f}s")
+            print(f"    Alive segments: {len(timeline.alive_segments)}, Alive time: {alive_time:.1f}s")
 
             if verbose and timeline.alive_segments:
                 print(f"    Alive segments:")
@@ -650,7 +648,8 @@ def format_info_json(
         player_data = {
             "name": player.name,
             "steamid": player.steamid,
-            "team": player.team,
+            "kills": player.kills,
+            "assists": player.assists,
         }
 
         if timeline:

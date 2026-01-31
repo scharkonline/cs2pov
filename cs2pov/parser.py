@@ -18,6 +18,8 @@ class PlayerInfo:
     name: str
     team: Optional[str] = None
     user_id: Optional[int] = None  # Player slot from demo (use user_id + 1 for spec_player)
+    kills: int = 0
+    assists: int = 0
 
 
 @dataclass
@@ -71,6 +73,12 @@ def parse_demo(demo_path: Path) -> DemoInfo:
         tick_df = parser.parse_ticks(["team_num", "user_id"])
         players = _extract_players(tick_df)
 
+        # Get kill/assist counts
+        kills, assists = _extract_kills_assists(parser)
+        for player in players:
+            player.kills = kills.get(player.steamid, 0)
+            player.assists = assists.get(player.steamid, 0)
+
         # Get round events
         rounds = _extract_rounds(parser)
 
@@ -116,6 +124,47 @@ def _extract_players(tick_df) -> list[PlayerInfo]:
             players.append(PlayerInfo(steamid=steamid, name=name, team=team, user_id=user_id))
 
     return players
+
+
+def _extract_kills_assists(parser: DemoParser) -> tuple[dict[int, int], dict[int, int]]:
+    """Extract kill and assist counts per player from player_death events.
+
+    Returns:
+        Tuple of (kills_dict, assists_dict) mapping steamid to count
+    """
+    kills: dict[int, int] = {}
+    assists: dict[int, int] = {}
+
+    try:
+        events_df = parser.parse_event("player_death")
+        if events_df is None or len(events_df) == 0:
+            return kills, assists
+
+        for _, row in events_df.iterrows():
+            # Count kills (attacker_steamid)
+            attacker = row.get("attacker_steamid")
+            if attacker is not None:
+                try:
+                    attacker_id = int(attacker)
+                    if attacker_id > 0:
+                        kills[attacker_id] = kills.get(attacker_id, 0) + 1
+                except (ValueError, TypeError):
+                    pass
+
+            # Count assists (assister_steamid)
+            assister = row.get("assister_steamid")
+            if assister is not None:
+                try:
+                    assister_id = int(assister)
+                    if assister_id > 0:
+                        assists[assister_id] = assists.get(assister_id, 0) + 1
+                except (ValueError, TypeError):
+                    pass
+
+    except Exception:
+        pass
+
+    return kills, assists
 
 
 def _extract_rounds(parser: DemoParser) -> list[RoundInfo]:
