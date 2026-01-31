@@ -19,6 +19,7 @@ from typing import Optional
 
 from . import __version__
 from .automation import send_key, check_demo_ended, wait_for_cs2_window, wait_for_demo_ready, parse_demo_end_info
+from .loading import LoadingAnimation
 from .capture import FFmpegCapture, get_default_audio_monitor
 from .config import RecordingConfig, generate_recording_cfg
 from .exceptions import CS2POVError
@@ -800,20 +801,21 @@ def cmd_info(args) -> int:
         return 1
 
     # Parse basic demo info
-    try:
-        demo_info = parse_demo(demo_path)
-    except CS2POVError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-    # Preprocess for timeline data (per-player)
-    player_timelines: dict[int, DemoTimeline] = {}
-    for player in demo_info.players:
+    with LoadingAnimation():
         try:
-            timeline = preprocess_demo(demo_path, player.steamid, player.name)
-            player_timelines[player.steamid] = timeline
-        except Exception:
-            pass
+            demo_info = parse_demo(demo_path)
+        except CS2POVError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+        # Preprocess for timeline data (per-player)
+        player_timelines: dict[int, DemoTimeline] = {}
+        for player in demo_info.players:
+            try:
+                timeline = preprocess_demo(demo_path, player.steamid, player.name)
+                player_timelines[player.steamid] = timeline
+            except Exception:
+                pass
 
     if args.json:
         output = format_info_json(demo_info, player_timelines)
