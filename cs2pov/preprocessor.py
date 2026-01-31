@@ -63,6 +63,20 @@ class RoundBoundary:
 
 
 @dataclass
+class RoundEndPeriod:
+    """Dead time between round end and next round start."""
+
+    round_end_tick: int
+    round_end_time: float
+    next_round_tick: int  # freeze_end - buffer
+    next_round_time: float
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.next_round_time - self.round_end_time
+
+
+@dataclass
 class DemoTimeline:
     """Complete timeline data for a player in a demo."""
 
@@ -76,6 +90,7 @@ class DemoTimeline:
     spawns: list[SpawnEvent] = field(default_factory=list)
     death_periods: list[DeathPeriod] = field(default_factory=list)
     rounds: list[RoundBoundary] = field(default_factory=list)
+    round_end_periods: list[RoundEndPeriod] = field(default_factory=list)
 
 
 def preprocess_demo(demo_path: Path, player_steamid: int, player_name: str = "") -> DemoTimeline:
@@ -116,11 +131,20 @@ def preprocess_demo(demo_path: Path, player_steamid: int, player_name: str = "")
         # Extract spawn events for the player
         spawns = _extract_spawns(parser, player_steamid, tickrate)
 
-        # Compute death periods (match deaths with subsequent spawns)
-        death_periods = compute_death_periods(deaths, spawns)
-
         # Extract round boundaries
         rounds = _extract_round_boundaries(parser, tickrate)
+
+        # Compute death periods using rounds (death -> 5s before next round freeze_end)
+        # This is more reliable than spawn events
+        death_periods = compute_death_periods_from_rounds(deaths, rounds, tickrate, buffer_seconds=5.0)
+
+        # Fallback to spawn-based if rounds didn't work
+        if not death_periods and deaths and spawns:
+            death_periods = compute_death_periods(deaths, spawns)
+
+        # Compute round end periods (round_end -> 5s before next round freeze_end)
+        # This trims dead time between rounds when the player survives
+        round_end_periods = compute_round_end_periods(rounds, tickrate, buffer_before_next=5.0, buffer_after_end=2.0)
 
         return DemoTimeline(
             player_steamid=player_steamid,
@@ -132,6 +156,7 @@ def preprocess_demo(demo_path: Path, player_steamid: int, player_name: str = "")
             spawns=spawns,
             death_periods=death_periods,
             rounds=rounds,
+            round_end_periods=round_end_periods,
         )
 
     except Exception as e:
@@ -229,7 +254,11 @@ def _extract_round_boundaries(parser: DemoParser, tickrate: float) -> list[Round
         # Parse each event type individually (parse_event only takes one event name)
         prestart_df = parser.parse_event("round_prestart")
         freeze_end_df = parser.parse_event("round_freeze_end")
-        round_end_df = parser.parse_event("round_officially_ended")
+
+        # Try multiple event names for round end (CS2 may use different names)
+        round_end_df = parser.parse_event("round_end")
+        if round_end_df is None or len(round_end_df) == 0:
+            round_end_df = parser.parse_event("round_officially_ended")
 
         # Convert to lists of (tick, time) tuples
         prestart_list = []
@@ -315,6 +344,122 @@ def compute_death_periods(deaths: list[DeathEvent], spawns: list[SpawnEvent]) ->
             spawn_idx += 1
 
     return death_periods
+
+
+def compute_death_periods_from_rounds(
+    deaths: list[DeathEvent],
+    rounds: list[RoundBoundary],
+    tickrate: float,
+    buffer_seconds: float = 5.0,
+) -> list[DeathPeriod]:
+    """Match each death with the next round's freeze_end minus a buffer.
+
+    Instead of using spawn events, this uses round boundaries to determine
+    when to cut back in: (freeze_end - buffer_seconds).
+
+    Args:
+        deaths: List of death events, sorted by tick
+        rounds: List of round boundaries, sorted by round_num
+        tickrate: Demo tickrate for time calculations
+        buffer_seconds: Seconds before freeze_end to cut back in (default 5s)
+
+    Returns:
+        List of DeathPeriod objects
+    """
+    if not deaths or not rounds:
+        return []
+
+    # Build list of freeze_end times (when rounds actually start)
+    freeze_end_times = []
+    for r in rounds:
+        if r.freeze_end_tick is not None and r.freeze_end_time is not None:
+            freeze_end_times.append((r.freeze_end_tick, r.freeze_end_time))
+
+    if not freeze_end_times:
+        return []
+
+    # Sort by tick
+    freeze_end_times.sort(key=lambda x: x[0])
+
+    death_periods = []
+    freeze_idx = 0
+
+    for death in deaths:
+        # Find next freeze_end after this death
+        while freeze_idx < len(freeze_end_times) and freeze_end_times[freeze_idx][0] <= death.tick:
+            freeze_idx += 1
+
+        if freeze_idx < len(freeze_end_times):
+            freeze_tick, freeze_time = freeze_end_times[freeze_idx]
+
+            # Calculate respawn time as (freeze_end - buffer)
+            buffer_ticks = int(buffer_seconds * tickrate)
+            respawn_tick = freeze_tick - buffer_ticks
+            respawn_time = freeze_time - buffer_seconds
+
+            # Only create period if respawn is after death
+            if respawn_tick > death.tick:
+                # Create a synthetic SpawnEvent for the respawn point
+                spawn = SpawnEvent(tick=respawn_tick, time_seconds=respawn_time)
+                death_periods.append(DeathPeriod(death=death, spawn=spawn))
+
+    return death_periods
+
+
+def compute_round_end_periods(
+    rounds: list[RoundBoundary],
+    tickrate: float,
+    buffer_before_next: float = 5.0,
+    buffer_after_end: float = 2.0,
+) -> list[RoundEndPeriod]:
+    """Compute dead time periods between round end and next round start.
+
+    For each round that has an end_tick, creates a period from
+    (round_end + buffer_after_end) to (next_round_freeze_end - buffer_before_next).
+
+    Args:
+        rounds: List of round boundaries, sorted by round_num
+        tickrate: Demo tickrate for time calculations
+        buffer_before_next: Seconds before freeze_end to cut back in (default 5s)
+        buffer_after_end: Seconds after round_end before starting trim (default 2s)
+
+    Returns:
+        List of RoundEndPeriod objects
+    """
+    if not rounds or len(rounds) < 2:
+        return []
+
+    round_end_periods = []
+    buffer_before_ticks = int(buffer_before_next * tickrate)
+    buffer_after_ticks = int(buffer_after_end * tickrate)
+
+    for i, current_round in enumerate(rounds[:-1]):  # Skip last round (no next round)
+        next_round = rounds[i + 1]
+
+        # Need both current round's end and next round's freeze_end
+        if current_round.end_tick is None or current_round.end_time is None:
+            continue
+        if next_round.freeze_end_tick is None or next_round.freeze_end_time is None:
+            continue
+
+        # Calculate trim start (round_end + buffer)
+        trim_start_tick = current_round.end_tick + buffer_after_ticks
+        trim_start_time = current_round.end_time + buffer_after_end
+
+        # Calculate trim end (freeze_end - buffer)
+        trim_end_tick = next_round.freeze_end_tick - buffer_before_ticks
+        trim_end_time = next_round.freeze_end_time - buffer_before_next
+
+        # Only create period if there's actual dead time to trim
+        if trim_end_tick > trim_start_tick:
+            round_end_periods.append(RoundEndPeriod(
+                round_end_tick=trim_start_tick,
+                round_end_time=trim_start_time,
+                next_round_tick=trim_end_tick,
+                next_round_time=trim_end_time,
+            ))
+
+    return round_end_periods
 
 
 def get_trim_periods(timeline: DemoTimeline) -> list[tuple[float, float]]:

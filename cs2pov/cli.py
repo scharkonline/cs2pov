@@ -376,12 +376,17 @@ def postprocess_video(
 
     trim_periods: list[TrimPeriod] = []
 
-    # Prefer timeline data
-    if timeline is not None and timeline.spawns:
+    # Prefer timeline data (need either spawns or rounds to calculate trims)
+    if timeline is not None and (timeline.spawns or timeline.rounds):
         print("  Using preprocessed timeline data (demoparser2)")
         if verbose:
-            print(f"  Deaths: {len(timeline.deaths)}, Spawns: {len(timeline.spawns)}")
+            print(f"  Deaths: {len(timeline.deaths)}, Spawns: {len(timeline.spawns)}, Rounds: {len(timeline.rounds)}")
+            print(f"  Death periods: {len(timeline.death_periods)}, Round end periods: {len(timeline.round_end_periods)}")
             print(f"  Tickrate: {timeline.tickrate}, Total ticks: {timeline.total_ticks}")
+            # Debug: show how many rounds have end_tick and freeze_end_tick
+            rounds_with_end = sum(1 for r in timeline.rounds if r.end_tick is not None)
+            rounds_with_freeze = sum(1 for r in timeline.rounds if r.freeze_end_tick is not None)
+            print(f"  Rounds with end_tick: {rounds_with_end}, with freeze_end: {rounds_with_freeze}")
 
         # Step 1: Get video duration and demo duration
         try:
@@ -439,15 +444,22 @@ def postprocess_video(
             print(f"  Startup time (to trim): {startup_time:.2f}s")
 
         # Step 3: Build trim periods
-        # First: trim from 0 to (startup_time + first_spawn_time)
+        # First: trim from 0 to (startup_time + first_action_time)
         # This removes the recording startup AND the demo freeze/warmup time
-        first_spawn_time = timeline.spawns[0].time_seconds if timeline.spawns else 0.0
-        initial_trim_end = startup_time + first_spawn_time
+        # Use first round's freeze_end - 5s as the cut-in point (consistent with death periods)
+        first_action_time = 0.0
+        if timeline.rounds and timeline.rounds[0].freeze_end_time is not None:
+            first_action_time = timeline.rounds[0].freeze_end_time - 5.0
+            first_action_time = max(0.0, first_action_time)  # Don't go negative
+        elif timeline.spawns:
+            first_action_time = timeline.spawns[0].time_seconds
+
+        initial_trim_end = startup_time + first_action_time
 
         if initial_trim_end > 0.5:  # Only trim if > 0.5s
             trim_periods.append(TrimPeriod(start_time=0.0, end_time=initial_trim_end))
             if verbose:
-                print(f"  Initial trim: 0.00s - {initial_trim_end:.2f}s (startup + freeze)")
+                print(f"  Initial trim: 0.00s - {initial_trim_end:.2f}s (startup + pre-action)")
 
         # Step 4: Add death periods (convert demo ticks to video time)
         # video_time = startup_time + demo_time
@@ -463,6 +475,19 @@ def postprocess_video(
                 if verbose:
                     duration = respawn_video_time - death_video_time
                     print(f"  Death period: {death_video_time:.2f}s - {respawn_video_time:.2f}s ({duration:.2f}s)")
+
+        # Step 5: Add round end periods (dead time between rounds when player survives)
+        for round_end_period in timeline.round_end_periods:
+            round_end_video_time = startup_time + round_end_period.round_end_time
+            next_round_video_time = startup_time + round_end_period.next_round_time
+
+            # Only include if after the initial trim
+            if next_round_video_time > initial_trim_end:
+                round_end_video_time = max(round_end_video_time, initial_trim_end)
+                trim_periods.append(TrimPeriod(start_time=round_end_video_time, end_time=next_round_video_time))
+                if verbose:
+                    duration = next_round_video_time - round_end_video_time
+                    print(f"  Round end period: {round_end_video_time:.2f}s - {next_round_video_time:.2f}s ({duration:.2f}s)")
 
     # Fall back to console.log parsing
     if not trim_periods:
@@ -940,7 +965,8 @@ def cmd_trim(args) -> int:
     timeline = None
     try:
         timeline = preprocess_demo(demo_path, player.steamid, player.name)
-        print(f"Using demo timeline: {len(timeline.deaths)} deaths, {len(timeline.spawns)} spawns")
+        print(f"Using demo timeline: {len(timeline.deaths)} deaths, {len(timeline.spawns)} spawns, {len(timeline.rounds)} rounds")
+        print(f"  {len(timeline.death_periods)} death periods, {len(timeline.round_end_periods)} round end periods")
     except Exception as e:
         print(f"Warning: Could not preprocess demo: {e}")
         print("Falling back to console.log method")
