@@ -261,8 +261,8 @@ def record_demo(
         if wait_for_demo_ready(console_log_path, timeout=180):
             print("  Demo ready")
             if verbose:
-                print("  Waiting 10s before hiding demo UI...")
-            time.sleep(10)
+                print("  Waiting 20s before hiding demo UI...")
+            time.sleep(20)
             if window_id and send_key("shift+F2", display_str, window_id):
                 if verbose:
                     print("  Sent Shift+F2 to hide demo UI")
