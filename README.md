@@ -132,3 +132,11 @@ You can't run multiple instances of CS through one account, so make sure it's cl
 ### Audio Capture
 
 I'm sorry for making you use Pulseaudio. The audio is captured from your default PulseAudio output so this captures all system audio, not just CS2.
+
+## TODO
+
+- [ ] Refactor navigator to make use of tick-based navigation
+
+- [ ] Update trimming tool to adhere and account for new navigation system
+
+- [ ] Add audio overlay functionality to trimming tool
