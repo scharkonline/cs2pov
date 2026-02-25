@@ -57,6 +57,7 @@ Record a player's POV and automatically trim death periods.
 
 ```bash
 cs2pov pov -d demo.dem -p "PlayerName" -o recording.mp4
+cs2pov pov -d demo.dem -p "PlayerName" -o recording.mp4 --tick-nav  # Skip deaths in real-time (faster)
 cs2pov pov -d demo.dem -p "PlayerName" -o recording.mp4 --no-trim  # Skip trimming
 ```
 
@@ -93,6 +94,7 @@ cs2pov trim raw.mp4 -d demo.dem -p "PlayerName" -o trimmed.mp4
 | `--audio-device` | | auto | PulseAudio device for audio capture |
 | `--display` | | 0 | X display number |
 | `--cs2-path` | | auto | Path to CS2 installation |
+| `--tick-nav` | | off | Skip death periods in real-time during recording |
 | `--verbose` | `-v` | off | Verbose output |
 
 ### Player Identification
@@ -107,17 +109,19 @@ The `--player` argument accepts multiple formats:
 ## How It Works
 
 1. **Parse demo** - Extract player list and metadata using demoparser2
-2. **Preprocess timeline** - Extract death/spawn events for accurate trimming
+2. **Preprocess timeline** - Extract death/spawn events and alive segments
 3. **Generate config** - Create CS2 CFG file with spectator settings
 4. **Copy demo** - Place demo in CS2's replays directory
 5. **Launch CS2** - Start CS2 via Steam with the generated config
-6. **Wait for first spawn** - Monitor console.log for player spawn
+6. **Wait for demo ready** - Monitor console.log for demo load
 7. **Hide demo UI** - Send Shift+F2 to hide playback controls
 8. **Start capture** - Launch FFmpeg to record display + audio (PulseAudio)
 9. **Recording loop** - Send F5 periodically to keep spectator locked on target player
-10. **Wait for demo end** - Monitor console.log for demo completion
+   - **Standard**: Record full demo, trim death periods in post-processing
+   - **`--tick-nav`**: Detect deaths in real-time via console.log, skip to next round with `demo_gototick`, only trim the brief seek artifacts in post-processing
+10. **Wait for demo end** - Monitor console.log for demo completion (or all segments complete with `--tick-nav`)
 11. **Finalize** - Stop capture and terminate CS2
-12. **Post-process** - Trim start and death periods from video using timeline data
+12. **Post-process** - Trim death periods or seek artifacts from video
 
 ## Noteworthy Issues/Workarounds
 
@@ -135,8 +139,8 @@ I'm sorry for making you use Pulseaudio. The audio is captured from your default
 
 ## TODO
 
-- [ ] Refactor navigator to make use of tick-based navigation
+- [x] Refactor navigator to make use of tick-based navigation
 
-- [ ] Update trimming tool to adhere and account for new navigation system
+- [x] Update trimming tool to adhere and account for new navigation system
 
 - [ ] Add audio overlay functionality to trimming tool

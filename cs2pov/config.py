@@ -16,6 +16,7 @@ class RecordingConfig:
     resolution: tuple[int, int] = (1920, 1080)
     hide_hud: bool = True
     spec_mode: int = 4  # 4 = first-person, 5 = third-person, 6 = free roam
+    tick_navigation: bool = False
 
     @property
     def player_account_id(self) -> int:
@@ -80,6 +81,14 @@ cl_draw_only_deathnotices 0
 cl_drawhud 1\
 """
 
+# Keybinds for tick-based navigation (pause/unpause via keybind is faster
+# than typing console commands since it's a single xdotool key press)
+TICK_NAV_BINDS = """
+// Tick navigation keybinds (used by --tick-nav)
+bind "F6" "demo_pause 0"
+bind "F7" "demo_pause 1"
+"""
+
 
 def generate_recording_cfg(config: RecordingConfig, output_path: Path) -> Path:
     """Generate a CS2 recording configuration file.
@@ -100,6 +109,9 @@ def generate_recording_cfg(config: RecordingConfig, output_path: Path) -> Path:
         player_slot=config.player_slot,
         demo_name=config.demo_name,
     )
+
+    if config.tick_navigation:
+        cfg_content += TICK_NAV_BINDS
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(cfg_content)

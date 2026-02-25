@@ -427,6 +427,76 @@ def trim_video_with_periods(
     return trim_death_periods(input_path, output_path, death_periods, verbose)
 
 
+def trim_goto_transitions(
+    input_path: Path,
+    output_path: Path,
+    transitions: list,
+    verbose: bool = False,
+) -> bool:
+    """Trim goto transition artifacts from a tick-nav recording.
+
+    When using tick-based navigation, each death triggers a pause/seek/unpause
+    cycle. The video between pause_video_time and unpause_video_time contains
+    the seek artifact and should be removed.
+
+    This converts transitions into "keep segments" (the gaps between transitions)
+    and uses extract_and_concat_segments to do the actual trimming.
+
+    Args:
+        input_path: Path to input video
+        output_path: Path for output video
+        transitions: List of GotoTransition objects
+        verbose: Print debug output
+
+    Returns:
+        True if trimming was performed, False on failure or nothing to trim
+    """
+    if not transitions:
+        if verbose:
+            print("    [Trim] No transitions to trim")
+        return False
+
+    # Get video duration
+    try:
+        video_duration = get_video_duration(input_path)
+    except CaptureError as e:
+        if verbose:
+            print(f"    [Trim] Failed to get video duration: {e}")
+        return False
+
+    # Build keep segments from the gaps between transitions
+    keep_segments: list[tuple[float, float]] = []
+    current_pos = 0.0
+
+    # Sort transitions by pause time
+    sorted_transitions = sorted(transitions, key=lambda t: t.pause_video_time)
+
+    for t in sorted_transitions:
+        # Keep segment before this transition's pause
+        if t.pause_video_time > current_pos + 0.5:
+            keep_segments.append((current_pos, t.pause_video_time))
+
+        # Skip past the transition artifact
+        current_pos = max(current_pos, t.unpause_video_time)
+
+    # Keep segment after last transition
+    if current_pos < video_duration - 0.5:
+        keep_segments.append((current_pos, video_duration))
+
+    if not keep_segments:
+        if verbose:
+            print("    [Trim] No segments to keep after transition removal")
+        return False
+
+    if verbose:
+        total_keep = sum(end - start for start, end in keep_segments)
+        total_trim = video_duration - total_keep
+        print(f"    [Trim] {len(transitions)} transitions → {len(keep_segments)} keep segments")
+        print(f"    [Trim] Keep: {total_keep:.1f}s, Trim: {total_trim:.1f}s")
+
+    return extract_and_concat_segments(input_path, output_path, keep_segments, verbose)
+
+
 def extract_and_concat_segments(
     input_path: Path,
     output_path: Path,

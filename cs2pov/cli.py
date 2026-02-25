@@ -24,6 +24,7 @@ from .capture import FFmpegCapture, get_default_audio_monitor
 from .config import RecordingConfig, generate_recording_cfg
 from .exceptions import CS2POVError
 from .game import CS2Process, find_cs2_path, get_cfg_dir, get_demo_dir
+from .navigation import GotoTransition, NavigationState, recording_loop_tick_nav
 from .parser import DemoInfo, PlayerInfo, find_player, get_player_index, parse_demo
 from .preprocessor import DemoTimeline, preprocess_demo, get_trim_periods
 from .trim import extract_death_periods
@@ -41,8 +42,9 @@ class RecordingResult:
     console_log_path: Path
     recording_start_time: float
     player_slot: int
-    exit_reason: str  # "demo_ended", "timeout", "ffmpeg_stopped", "interrupted"
+    exit_reason: str  # "demo_ended", "timeout", "ffmpeg_stopped", "interrupted", "segments_complete"
     timeline: Optional[DemoTimeline] = None
+    transitions: Optional[list[GotoTransition]] = None
 
 
 # =============================================================================
@@ -149,6 +151,7 @@ def record_demo(
     cs2_path_override: Path | None = None,
     enable_audio: bool = True,
     audio_device: str | None = None,
+    tick_nav: bool = False,
 ) -> RecordingResult:
     """Record a player's POV from a demo file."""
     # Find CS2 installation
@@ -208,6 +211,7 @@ def record_demo(
         player_slot=player_slot,
         resolution=resolution,
         hide_hud=hide_hud,
+        tick_navigation=tick_nav,
     )
     generate_recording_cfg(config, cfg_path)
     print(f"Generated config: {cfg_path.name}")
@@ -297,15 +301,40 @@ def record_demo(
             print(f"  FFmpeg capture started (video only)")
 
         recording_start_time = time.time()
+        transitions = None
 
-        exit_reason = recording_loop(
-            display=display_str,
-            console_log_path=console_log_path,
-            cs2_process=cs2_process,
-            ffmpeg=ffmpeg,
-            timeout=timeout,
-            verbose=verbose,
+        # Use tick-based navigation if enabled and timeline available
+        use_tick_nav = (
+            tick_nav
+            and timeline is not None
+            and timeline.alive_segments
         )
+
+        if use_tick_nav:
+            nav_state = NavigationState(
+                timeline=timeline,
+                player_slot=player_slot - 1,  # Convert 1-based spec slot to 0-based console slot
+            )
+            exit_reason, transitions = recording_loop_tick_nav(
+                display=display_str,
+                console_log_path=console_log_path,
+                cs2_process=cs2_process,
+                ffmpeg=ffmpeg,
+                state=nav_state,
+                timeout=timeout,
+                verbose=verbose,
+            )
+        else:
+            if tick_nav and (timeline is None or not timeline.alive_segments):
+                print("  Warning: --tick-nav requires alive segments, falling back to standard recording")
+            exit_reason = recording_loop(
+                display=display_str,
+                console_log_path=console_log_path,
+                cs2_process=cs2_process,
+                ffmpeg=ffmpeg,
+                timeout=timeout,
+                verbose=verbose,
+            )
 
     except KeyboardInterrupt:
         print("\n  Recording interrupted by user")
@@ -336,7 +365,7 @@ def record_demo(
             print(f"  Console log saved: {saved_log_path.name}")
             console_log_path = saved_log_path
 
-    success = exit_reason in ("demo_ended", "cs2_exited")
+    success = exit_reason in ("demo_ended", "cs2_exited", "segments_complete")
     return RecordingResult(
         success=success,
         video_path=output_path,
@@ -345,6 +374,7 @@ def record_demo(
         player_slot=player_index,
         exit_reason=exit_reason,
         timeline=timeline,
+        transitions=transitions,
     )
 
 
@@ -356,10 +386,14 @@ def postprocess_video(
     verbose: bool = False,
     timeline: Optional[DemoTimeline] = None,
     startup_time_override: Optional[float] = None,
+    transitions: Optional[list[GotoTransition]] = None,
 ) -> Path:
     """Post-process a recorded video to keep only alive segments.
 
-    New simplified approach:
+    If transitions are provided (from tick-nav recording), uses lightweight
+    transition-based trimming instead of the full alive-segment approach.
+
+    Otherwise uses the standard approach:
     1. Calculate startup_time = video_duration - demo_duration
     2. Convert alive_segments from demo time to video time
     3. Extract and concatenate only the alive segments
@@ -367,8 +401,9 @@ def postprocess_video(
     Args:
         startup_time_override: If provided, use this value instead of calculating
             startup_time. Useful when the automatic calculation is wrong.
+        transitions: If provided, use transition-based trimming (from --tick-nav)
     """
-    from .trim import get_video_duration, extract_and_concat_segments
+    from .trim import get_video_duration, extract_and_concat_segments, trim_goto_transitions
 
     if not video_path.exists():
         print(f"Error: Video file not found: {video_path}")
@@ -376,6 +411,30 @@ def postprocess_video(
 
     raw_size_mb = video_path.stat().st_size / (1024 * 1024)
     print(f"\nRaw recording: {video_path} ({raw_size_mb:.1f} MB)")
+
+    # Tick-nav transition-based trimming (lightweight)
+    if transitions:
+        print(f"\nPost-processing: trimming {len(transitions)} goto transitions...")
+        raw_path = video_path.parent / f"{video_path.stem}_raw{video_path.suffix}"
+        video_path.rename(raw_path)
+        print(f"  Raw recording moved to: {raw_path.name}")
+
+        success = trim_goto_transitions(
+            input_path=raw_path,
+            output_path=video_path,
+            transitions=transitions,
+            verbose=verbose,
+        )
+
+        if success and video_path.exists():
+            final_size_mb = video_path.stat().st_size / (1024 * 1024)
+            print(f"\nFinal recording: {video_path} ({final_size_mb:.1f} MB)")
+        else:
+            print("\nTransition trimming failed, restoring raw recording")
+            if not video_path.exists() and raw_path.exists():
+                raw_path.rename(video_path)
+
+        return video_path
 
     print("\nPost-processing: calculating segments to keep...")
 
@@ -732,6 +791,8 @@ Examples:
                                 help="PulseAudio device (auto-detected)")
     recording_args.add_argument("--cs2-path", type=Path,
                                 help="Custom CS2 installation path")
+    recording_args.add_argument("--tick-nav", action="store_true",
+                                help="Enable tick-based navigation (skip deaths in real-time)")
 
     verbose_args = argparse.ArgumentParser(add_help=False)
     verbose_args.add_argument("-v", "--verbose", action="store_true",
@@ -864,6 +925,7 @@ def cmd_pov(args) -> int:
             cs2_path_override=args.cs2_path,
             enable_audio=not args.no_audio,
             audio_device=args.audio_device,
+            tick_nav=args.tick_nav,
         )
 
         # Post-process
@@ -875,6 +937,7 @@ def cmd_pov(args) -> int:
                 recording_start_time=result.recording_start_time,
                 verbose=args.verbose,
                 timeline=result.timeline,
+                transitions=result.transitions,
             )
         elif result.success:
             size_mb = result.video_path.stat().st_size / (1024 * 1024)
@@ -926,6 +989,7 @@ def cmd_record(args) -> int:
             cs2_path_override=args.cs2_path,
             enable_audio=not args.no_audio,
             audio_device=args.audio_device,
+            tick_nav=args.tick_nav,
         )
 
         if result.success:

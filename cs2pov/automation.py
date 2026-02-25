@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -167,13 +168,11 @@ def wait_for_map_load(log_path: Path, timeout: float = 120, poll_interval: float
     Returns:
         True if map load detected, False if timeout
     """
-    import time
-
     map_load_pattern = re.compile(r"\[Client\] Created physics for")
-    start = time.time()
+    start_t = time.time()
     last_position = 0
 
-    while time.time() - start < timeout:
+    while time.time() - start_t < timeout:
         if not log_path.exists():
             time.sleep(poll_interval)
             continue
@@ -213,15 +212,13 @@ def wait_for_demo_ready(
     Returns:
         True if ready state detected, False if timeout
     """
-    import time
-
     ready_pattern = re.compile(
         r"\[HostStateManager\] Host activate: Playing Demo"
     )
-    start = time.time()
+    start_t = time.time()
     last_position = 0
 
-    while time.time() - start < timeout:
+    while time.time() - start_t < timeout:
         if not log_path.exists():
             time.sleep(poll_interval)
             continue
@@ -253,7 +250,6 @@ def wait_for_cs2_window(display: str = ":0", timeout: float = 120, poll_interval
     Returns:
         Window ID when found, or None if timeout
     """
-    import time
     start = time.time()
     while time.time() - start < timeout:
         window_id = find_cs2_window(display)
@@ -261,3 +257,175 @@ def wait_for_cs2_window(display: str = ":0", timeout: float = 120, poll_interval
             return window_id
         time.sleep(poll_interval)
     return None
+
+
+# =============================================================================
+# Tick-based navigation primitives
+# =============================================================================
+
+def send_console_command(command: str, display: str, window_id: str) -> bool:
+    """Send a console command to CS2 by opening console, typing, and closing.
+
+    Opens console (grave key), types the command, presses Return, closes console.
+    Includes small delays between steps for reliability.
+
+    Args:
+        command: Console command to send (e.g. "demo_gototick 12345")
+        display: X display string
+        window_id: CS2 window ID
+
+    Returns:
+        True if all xdotool steps succeeded
+    """
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    steps = [
+        # Open console
+        (["xdotool", "key", "--window", window_id, "grave"], 0.1),
+        # Type command
+        (["xdotool", "type", "--window", window_id, "--clearmodifiers", command], 0.05),
+        # Press enter
+        (["xdotool", "key", "--window", window_id, "Return"], 0.1),
+        # Close console
+        (["xdotool", "key", "--window", window_id, "grave"], 0.0),
+    ]
+
+    for cmd, delay in steps:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=env)
+            if result.returncode != 0:
+                return False
+        except Exception:
+            return False
+        if delay > 0:
+            time.sleep(delay)
+
+    return True
+
+
+def read_paused_tick(
+    console_log_path: Path,
+    last_position: int,
+    timeout: float = 5.0,
+) -> tuple[Optional[int], int]:
+    """After a demo_pause, poll console.log for the paused tick line.
+
+    Looks for: CGameRules - paused on tick X
+
+    Args:
+        console_log_path: Path to CS2 console.log
+        last_position: File position to start reading from
+        timeout: Maximum time to wait
+
+    Returns:
+        (tick, new_position) or (None, position) on timeout
+    """
+    pattern = re.compile(r"CGameRules - paused on tick (\d+)")
+    start = time.time()
+
+    while time.time() - start < timeout:
+        if not console_log_path.exists():
+            time.sleep(0.1)
+            continue
+
+        try:
+            with open(console_log_path, 'r', errors='ignore') as f:
+                f.seek(last_position)
+                content = f.read()
+                new_position = f.tell()
+
+                match = pattern.search(content)
+                if match:
+                    return int(match.group(1)), new_position
+
+                last_position = new_position
+        except Exception:
+            pass
+
+        time.sleep(0.1)
+
+    return None, last_position
+
+
+def calibrate_tick_offset(
+    console_log_path: Path,
+    display: str,
+    window_id: str,
+    log_position: int,
+    verbose: bool = False,
+) -> tuple[int, int]:
+    """Calibrate the tick offset by pausing and reading actual tick.
+
+    At startup after map load, we pause, read the actual tick from console,
+    and compute the offset. All future demo_gototick calls subtract this
+    offset from their target.
+
+    Args:
+        console_log_path: Path to CS2 console.log
+        display: X display string
+        window_id: CS2 window ID
+        log_position: Current position in console.log
+        verbose: Print debug output
+
+    Returns:
+        (offset, new_log_position). offset = actual_tick read from console.
+    """
+    # Pause demo via F7 (bound to demo_pause 1)
+    send_key("F7", display, window_id)
+    time.sleep(0.5)
+
+    # Read the paused tick from console
+    actual_tick, log_position = read_paused_tick(console_log_path, log_position, timeout=5.0)
+
+    # Unpause via F6 (bound to demo_pause 0)
+    send_key("F6", display, window_id)
+
+    if actual_tick is not None:
+        offset = actual_tick
+        if verbose:
+            print(f"    Tick calibration: actual_tick={actual_tick}, offset={offset}")
+        return offset, log_position
+    else:
+        if verbose:
+            print(f"    Tick calibration failed, using offset=0")
+        return 0, log_position
+
+
+def check_death_in_console(
+    console_log_path: Path,
+    player_slot: int,
+    last_position: int,
+) -> tuple[bool, int]:
+    """Check console.log for player death (Shutdown prediction).
+
+    Incrementally reads console.log looking for:
+    [Prediction] Shutdown prediction for player slot {player_slot}
+
+    Args:
+        console_log_path: Path to CS2 console.log
+        player_slot: 0-based player slot index
+        last_position: File position to start reading from
+
+    Returns:
+        (detected, new_position)
+    """
+    if not console_log_path.exists():
+        return False, last_position
+
+    pattern = re.compile(
+        rf"\[Prediction\] Shutdown prediction for player slot {player_slot}\b"
+    )
+
+    try:
+        with open(console_log_path, 'r', errors='ignore') as f:
+            f.seek(last_position)
+            content = f.read()
+            new_position = f.tell()
+
+            if pattern.search(content):
+                return True, new_position
+
+            return False, new_position
+    except Exception:
+        return False, last_position
