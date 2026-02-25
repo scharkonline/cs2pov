@@ -261,10 +261,9 @@ def recording_loop_tick_nav(
                     death_log_position, verbose
                 )
                 # Advance past any messages generated during gototick seek
-                death_log_position = console_log_path.stat().st_size
-                #eof = console_log_path.stat().st_size
-                #death_log_position = eof
-                #log_position = eof
+                eof = console_log_path.stat().st_size
+                death_log_position = eof
+                log_position = eof
                 state.segment_start_wall_time = time.time()
                 if not has_more:
                     print("  All alive segments complete")
@@ -308,10 +307,9 @@ def recording_loop_tick_nav(
                         death_log_position, verbose
                     )
                     # Advance past any messages generated during gototick seek
-                    death_log_position = console_log_path.stat().st_size
-                    #eof = console_log_path.stat().st_size
-                    #death_log_position = eof
-                    #log_position = eof
+                    eof = console_log_path.stat().st_size
+                    death_log_position = eof
+                    log_position = eof
                     state.segment_start_wall_time = time.time()
                     if not has_more:
                         print("  All alive segments complete")
