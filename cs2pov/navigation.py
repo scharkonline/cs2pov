@@ -46,6 +46,7 @@ class NavigationState:
     current_segment_index: int = 0
     transitions: list[GotoTransition] = field(default_factory=list)
     recording_start_time: float = 0.0
+    segment_start_wall_time: float = 0.0
     buffer_seconds: float = 5.0
 
 
@@ -118,7 +119,7 @@ def handle_death(
     adjusted_tick = compute_goto_tick(target_tick, state.tick_offset)
 
     if verbose:
-        print(f"    Death detected! Seeking to segment {state.current_segment_index + 1} "
+        print(f"    Seeking to segment {state.current_segment_index + 1} "
               f"(tick {target_tick}, adjusted {adjusted_tick})")
 
     # Send demo_gototick command
@@ -220,6 +221,8 @@ def recording_loop_tick_nav(
 
     print(f"  {len(state.timeline.alive_segments)} alive segments to navigate")
 
+    state.segment_start_wall_time = time.time()
+
     while True:
         elapsed = time.time() - start_time
 
@@ -245,17 +248,44 @@ def recording_loop_tick_nav(
 
         # Check for death (only if we have a window to navigate with)
         if window_id:
+            death_triggered = False
             death_detected, death_log_position = check_death_in_console(
                 console_log_path, state.player_slot, death_log_position
             )
             if death_detected:
+                if verbose:
+                    print(f"    Death detected (segment {state.current_segment_index + 1})")
                 has_more, death_log_position = handle_death(
                     state, display, window_id, console_log_path,
                     death_log_position, verbose
                 )
+                # Advance past any death messages generated during gototick seek
+                death_log_position = console_log_path.stat().st_size
+                state.segment_start_wall_time = time.time()
                 if not has_more:
                     print("  All alive segments complete")
                     return "segments_complete", state.transitions
+                death_triggered = True
+
+            # Time-based segment end: skip forward when alive segment duration elapsed
+            if not death_triggered and state.current_segment_index < len(state.timeline.alive_segments):
+                current_seg = state.timeline.alive_segments[state.current_segment_index]
+                expected_duration = current_seg.end_time - current_seg.start_time
+                segment_elapsed = time.time() - state.segment_start_wall_time
+                if segment_elapsed >= expected_duration:
+                    if verbose:
+                        print(f"    Segment {state.current_segment_index + 1} timer expired "
+                              f"({expected_duration:.1f}s elapsed, reason: {current_seg.reason_ended})")
+                    has_more, death_log_position = handle_death(
+                        state, display, window_id, console_log_path,
+                        death_log_position, verbose
+                    )
+                    # Advance past any death messages generated during gototick seek
+                    death_log_position = console_log_path.stat().st_size
+                    state.segment_start_wall_time = time.time()
+                    if not has_more:
+                        print("  All alive segments complete")
+                        return "segments_complete", state.transitions
 
         # Send spec_lock (F5) every 3 seconds
         if elapsed - last_spec_lock >= 3.0:
