@@ -13,7 +13,7 @@ from typing import Optional
 
 from .automation import (
     check_death_in_console,
-    check_demo_ended,
+    check_demo_ended_tick_aware,
     calibrate_tick_offset,
     find_cs2_window,
     send_console_command,
@@ -200,14 +200,23 @@ def recording_loop_tick_nav(
     else:
         print("    Warning: CS2 window not found for tick navigation")
 
-    # Calibrate tick offset
-    if window_id:
-        print("  Calibrating tick offset...")
-        state.tick_offset, log_position = calibrate_tick_offset(
-            console_log_path, display, window_id, log_position, verbose
-        )
-        death_log_position = log_position
-        print(f"  Tick offset: {state.tick_offset}")
+    # TODO: Tick offset calibration disabled — demo_gototick appears to land
+    # accurately without correction. Re-enable if drift is observed.
+    # if window_id:
+    #     print("  Calibrating tick offset...")
+    #     state.tick_offset, log_position = calibrate_tick_offset(
+    #         console_log_path, display, window_id, log_position, verbose
+    #     )
+    #     death_log_position = log_position
+    #     print(f"  Tick offset: {state.tick_offset}")
+    state.tick_offset = 0
+
+    # Compute minimum tick that indicates a real demo end (not a navigation pause).
+    # Any "paused on tick X" where X is below this is from our own calibration/navigation.
+    last_segment = state.timeline.alive_segments[-1]
+    min_end_tick = last_segment.end_tick
+    if verbose:
+        print(f"    Demo end threshold: tick >= {min_end_tick}")
 
     print(f"  {len(state.timeline.alive_segments)} alive segments to navigate")
 
@@ -226,8 +235,10 @@ def recording_loop_tick_nav(
             print("  FFmpeg stopped unexpectedly")
             return "ffmpeg_stopped", state.transitions
 
-        # Check for demo end
-        demo_ended, log_position = check_demo_ended(console_log_path, log_position)
+        # Check for demo end — only if paused tick is past our last alive segment
+        demo_ended, log_position = check_demo_ended_tick_aware(
+            console_log_path, log_position, min_end_tick
+        )
         if demo_ended:
             print("  Demo end detected in console.log")
             return "demo_ended", state.transitions

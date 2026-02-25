@@ -107,6 +107,47 @@ def check_demo_ended(log_path: Path, last_position: int = 0) -> tuple[bool, int]
         return False, last_position
 
 
+def check_demo_ended_tick_aware(
+    log_path: Path,
+    last_position: int,
+    min_end_tick: int,
+) -> tuple[bool, int]:
+    """Check if demo has ended, filtering out pauses from navigation.
+
+    In tick-nav mode, 'CGameRules - paused on tick X' lines appear from our
+    own deliberate pauses (calibration, death handling). This function only
+    considers it a real demo end if the tick is past min_end_tick.
+
+    Args:
+        log_path: Path to CS2 console.log
+        last_position: File position to start reading from
+        min_end_tick: Only consider ended if paused tick >= this value.
+            Typically the last alive segment's end tick.
+
+    Returns:
+        Tuple of (demo_ended: bool, new_position: int)
+    """
+    if not log_path.exists():
+        return False, last_position
+
+    demo_end_pattern = re.compile(r"CGameRules - paused on tick (\d+)")
+
+    try:
+        with open(log_path, 'r', errors='ignore') as f:
+            f.seek(last_position)
+            content = f.read()
+            new_position = f.tell()
+
+            for match in demo_end_pattern.finditer(content):
+                tick = int(match.group(1))
+                if tick >= min_end_tick:
+                    return True, new_position
+
+            return False, new_position
+    except Exception:
+        return False, last_position
+
+
 @dataclass
 class DemoEndInfo:
     """Information about when the demo ended."""
@@ -353,38 +394,52 @@ def calibrate_tick_offset(
     display: str,
     window_id: str,
     log_position: int,
+    calibration_tick: int = 0,
     verbose: bool = False,
 ) -> tuple[int, int]:
-    """Calibrate the tick offset by pausing and reading actual tick.
+    """Calibrate the tick offset by sending demo_gototick and measuring drift.
 
-    At startup after map load, we pause, read the actual tick from console,
-    and compute the offset. All future demo_gototick calls subtract this
-    offset from their target.
+    demo_gototick X doesn't land exactly at tick X — there's a consistent
+    drift per demo. We measure it by:
+    1. Send demo_gototick to a known tick
+    2. Pause and read actual tick from console
+    3. offset = actual_tick - requested_tick
+    4. Resume playback
+
+    All future goto calls subtract this offset: demo_gototick(target - offset).
 
     Args:
         console_log_path: Path to CS2 console.log
         display: X display string
         window_id: CS2 window ID
         log_position: Current position in console.log
+        calibration_tick: Tick to goto for calibration (default 0)
         verbose: Print debug output
 
     Returns:
-        (offset, new_log_position). offset = actual_tick read from console.
+        (offset, new_log_position). offset = actual_tick - calibration_tick.
     """
-    # Pause demo via F7 (bound to demo_pause 1)
+    # Seek to the calibration tick
+    send_console_command(f"demo_gototick {calibration_tick}", display, window_id)
+    time.sleep(2.0)
+
+    # Pause demo via F7
     send_key("F7", display, window_id)
-    time.sleep(0.5)
+    time.sleep(1.0)
 
     # Read the paused tick from console
     actual_tick, log_position = read_paused_tick(console_log_path, log_position, timeout=5.0)
 
-    # Unpause via F6 (bound to demo_pause 0)
+    # Let CS2 settle before unpausing
+    time.sleep(0.5)
+
+    # Resume via F6 (demo_resume — idempotent)
     send_key("F6", display, window_id)
 
     if actual_tick is not None:
-        offset = actual_tick
+        offset = actual_tick - calibration_tick
         if verbose:
-            print(f"    Tick calibration: actual_tick={actual_tick}, offset={offset}")
+            print(f"    Tick calibration: goto {calibration_tick} → landed at {actual_tick}, offset={offset}")
         return offset, log_position
     else:
         if verbose:

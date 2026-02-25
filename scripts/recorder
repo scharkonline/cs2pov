@@ -1,8 +1,5 @@
 # POV recorder
-cs2pov pov -d /path/to/demo.dem -p "player" -o /path/to/output.mp4
+cs2pov pov -d ./demos/260224/nuke.dem -p "schark" -o ./recordings/260224/schark_nuke.mp4 --tick-nav
+sleep 10
+cs2pov pov -d ./demos/260224/ancient.dem -p "schark" -o ./recordings/260224/schark_ancient.mp4 --tick-nav
 
-# Trim
-cs2pov trim /path/to/recording_raw.mp4 -d /path/to/demo.dem -p "player" -o /path/to/output.mp4
-
-# Info
-cs2pov info /path/to/demo.dem

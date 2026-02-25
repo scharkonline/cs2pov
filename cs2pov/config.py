@@ -83,10 +83,12 @@ cl_drawhud 1\
 
 # Keybinds for tick-based navigation (pause/unpause via keybind is faster
 # than typing console commands since it's a single xdotool key press)
+# NOTE: demo_pause toggles regardless of argument, so we use demo_resume
+# for unpausing which is idempotent (safe to send multiple times).
 TICK_NAV_BINDS = """
 // Tick navigation keybinds (used by --tick-nav)
-bind "F6" "demo_pause 0"
-bind "F7" "demo_pause 1"
+bind "F6" "demo_resume"
+bind "F7" "demo_pause"
 """
 
 
