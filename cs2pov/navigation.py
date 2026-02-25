@@ -255,12 +255,16 @@ def recording_loop_tick_nav(
             if death_detected:
                 if verbose:
                     print(f"    Death detected (segment {state.current_segment_index + 1})")
+                time.sleep(0.9)  # Brief delay to show death context
                 has_more, death_log_position = handle_death(
                     state, display, window_id, console_log_path,
                     death_log_position, verbose
                 )
-                # Advance past any death messages generated during gototick seek
+                # Advance past any messages generated during gototick seek
                 death_log_position = console_log_path.stat().st_size
+                #eof = console_log_path.stat().st_size
+                #death_log_position = eof
+                #log_position = eof
                 state.segment_start_wall_time = time.time()
                 if not has_more:
                     print("  All alive segments complete")
@@ -270,18 +274,44 @@ def recording_loop_tick_nav(
             # Time-based segment end: skip forward when alive segment duration elapsed
             if not death_triggered and state.current_segment_index < len(state.timeline.alive_segments):
                 current_seg = state.timeline.alive_segments[state.current_segment_index]
-                expected_duration = current_seg.end_time - current_seg.start_time
+
+                # Determine when to trigger the skip
+                target_end_time = current_seg.end_time
+                if current_seg.reason_ended == "round_end":
+                    # Extend to next round's prestart (freeze time begins),
+                    # minus 0.1s to avoid bleeding into the next round
+                    next_idx = state.current_segment_index + 1
+                    if next_idx < len(state.timeline.alive_segments):
+                        next_seg = state.timeline.alive_segments[next_idx]
+                        for r in state.timeline.rounds:
+                            if r.round_num == next_seg.round_num and r.prestart_time is not None:
+                                target_end_time = r.prestart_time - 0.2
+                                break
+
+                # For segment 0, use target_end_time directly (time from demo start)
+                # since we don't know the exact demo position when the loop started.
+                # For subsequent segments (after gototick), demo is at start_time.
+                if state.current_segment_index == 0:
+                    expected_duration = target_end_time
+                else:
+                    expected_duration = target_end_time - current_seg.start_time
+
                 segment_elapsed = time.time() - state.segment_start_wall_time
                 if segment_elapsed >= expected_duration:
                     if verbose:
                         print(f"    Segment {state.current_segment_index + 1} timer expired "
                               f"({expected_duration:.1f}s elapsed, reason: {current_seg.reason_ended})")
+                    if current_seg.reason_ended == "death":
+                        time.sleep(0.9)  # Brief delay to show death context
                     has_more, death_log_position = handle_death(
                         state, display, window_id, console_log_path,
                         death_log_position, verbose
                     )
-                    # Advance past any death messages generated during gototick seek
+                    # Advance past any messages generated during gototick seek
                     death_log_position = console_log_path.stat().st_size
+                    #eof = console_log_path.stat().st_size
+                    #death_log_position = eof
+                    #log_position = eof
                     state.segment_start_wall_time = time.time()
                     if not has_more:
                         print("  All alive segments complete")
