@@ -287,13 +287,7 @@ def recording_loop_tick_nav(
                                 target_end_time = r.prestart_time - 0.2
                                 break
 
-                # For segment 0, use target_end_time directly (time from demo start)
-                # since we don't know the exact demo position when the loop started.
-                # For subsequent segments (after gototick), demo is at start_time.
-                if state.current_segment_index == 0:
-                    expected_duration = target_end_time
-                else:
-                    expected_duration = target_end_time - current_seg.start_time
+                expected_duration = target_end_time - current_seg.start_time
 
                 segment_elapsed = time.time() - state.segment_start_wall_time
                 if segment_elapsed >= expected_duration:
