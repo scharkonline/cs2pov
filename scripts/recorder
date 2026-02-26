@@ -1,5 +1,14 @@
-# POV recorder
-cs2pov pov -d ./demos/260224/nuke.dem -p "schark" -o ./recordings/260224/schark_nuke.mp4 --tick-nav
-sleep 10
-cs2pov pov -d ./demos/260224/ancient.dem -p "schark" -o ./recordings/260224/schark_ancient.mp4 --tick-nav
+#!/bin/bash
+# DEPRECATED: Use cs2pov.json config file instead.
+#
+# Create a config:
+#   cs2pov init
+#
+# Edit cs2pov.json with your jobs, then run:
+#   cs2pov pov
+#
+# See cs2pov.json for the config format.
 
+echo "This script is deprecated. Use 'cs2pov init' to create a cs2pov.json config,"
+echo "then run 'cs2pov pov' to process all jobs."
+exit 1

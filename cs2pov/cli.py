@@ -24,6 +24,10 @@ from .capture import FFmpegCapture, get_default_audio_monitor
 from .config import RecordingConfig, generate_recording_cfg
 from .exceptions import CS2POVError
 from .game import CS2Process, find_cs2_path, get_cfg_dir, get_demo_dir
+from .settings import (
+    ConfigError, find_config, load_config, resolve_job, resolve_paths,
+    merge_args_with_config, generate_default_config, HARDCODED_DEFAULTS,
+)
 from .navigation import GotoTransition, NavigationState, recording_loop_tick_nav
 from .parser import DemoInfo, PlayerInfo, find_player, get_player_index, parse_demo
 from .preprocessor import DemoTimeline, preprocess_demo, get_trim_periods
@@ -752,50 +756,55 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
+  cs2pov                                   # Run all jobs from cs2pov.json
+  cs2pov init                              # Create cs2pov.json config
   cs2pov info demo.dem                     # Show demo information
   cs2pov info demo.dem --json              # Output as JSON
   cs2pov pov -d demo.dem -p "Player" -o out.mp4
+  cs2pov pov                               # Run batch pov jobs from cs2pov.json
   cs2pov record -d demo.dem -p "Player" -o raw.mp4
   cs2pov trim raw.mp4 -d demo.dem -p "Player"
 """,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="Path to cs2pov.json config file (default: auto-detect)")
 
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    subparsers = parser.add_subparsers(dest="command", required=False, metavar="COMMAND")
 
     # Shared argument groups
     demo_args = argparse.ArgumentParser(add_help=False)
-    demo_args.add_argument("-d", "--demo", required=True, type=Path,
+    demo_args.add_argument("-d", "--demo", default=None, type=Path,
                            help="Demo file (.dem)")
 
     player_args = argparse.ArgumentParser(add_help=False)
-    player_args.add_argument("-p", "--player", required=True,
+    player_args.add_argument("-p", "--player", default=None,
                              help="Player name or SteamID")
 
     output_args = argparse.ArgumentParser(add_help=False)
-    output_args.add_argument("-o", "--output", required=True, type=Path,
+    output_args.add_argument("-o", "--output", default=None, type=Path,
                              help="Output video file")
 
     recording_args = argparse.ArgumentParser(add_help=False)
-    recording_args.add_argument("-r", "--resolution", default="1920x1080",
+    recording_args.add_argument("-r", "--resolution", default=None,
                                 help="Recording resolution (default: 1920x1080)")
-    recording_args.add_argument("-f", "--framerate", type=int, default=60,
+    recording_args.add_argument("-f", "--framerate", type=int, default=None,
                                 help="Recording framerate (default: 60)")
-    recording_args.add_argument("--display", type=int, default=0,
+    recording_args.add_argument("--display", type=int, default=None,
                                 help="X display number (default: 0)")
-    recording_args.add_argument("--no-hud", action="store_true",
+    recording_args.add_argument("--no-hud", action="store_true", default=None,
                                 help="Hide HUD elements")
-    recording_args.add_argument("--no-audio", action="store_true",
+    recording_args.add_argument("--no-audio", action="store_true", default=None,
                                 help="Disable audio recording")
-    recording_args.add_argument("--audio-device",
+    recording_args.add_argument("--audio-device", default=None,
                                 help="PulseAudio device (auto-detected)")
-    recording_args.add_argument("--cs2-path", type=Path,
+    recording_args.add_argument("--cs2-path", type=Path, default=None,
                                 help="Custom CS2 installation path")
-    recording_args.add_argument("--tick-nav", action="store_true",
+    recording_args.add_argument("--tick-nav", action="store_true", default=None,
                                 help="Enable tick-based navigation (skip deaths in real-time)")
 
     verbose_args = argparse.ArgumentParser(add_help=False)
-    verbose_args.add_argument("-v", "--verbose", action="store_true",
+    verbose_args.add_argument("-v", "--verbose", action="store_true", default=None,
                               help="Verbose output")
 
     # INFO command
@@ -816,7 +825,7 @@ Examples:
         help="Record and trim player POV (full pipeline)",
         description="Record a player's POV from a demo and trim death periods.",
     )
-    pov_parser.add_argument("--no-trim", action="store_true",
+    pov_parser.add_argument("--no-trim", action="store_true", default=None,
                             help="Skip post-processing trim")
 
     # RECORD command
@@ -847,12 +856,173 @@ Examples:
     trim_parser.add_argument("--startup-time", type=float,
                              help="Override startup time (seconds from video start to demo start)")
 
+    # INIT command
+    subparsers.add_parser(
+        "init",
+        help="Create a cs2pov.json config file in the current directory",
+        description="Generate a template cs2pov.json config with defaults and example jobs.",
+    )
+
     return parser
 
 
 # =============================================================================
 # Command Handlers
 # =============================================================================
+
+def _validate_required_args(args, command: str) -> Optional[str]:
+    """Validate that required args (demo, player, output) are present after merging.
+
+    Returns error message or None if valid.
+    """
+    missing = []
+    if getattr(args, "demo", None) is None:
+        missing.append("-d/--demo")
+    if getattr(args, "player", None) is None:
+        missing.append("-p/--player")
+    if getattr(args, "output", None) is None:
+        missing.append("-o/--output")
+
+    if missing:
+        return f"Missing required arguments for '{command}': {', '.join(missing)}"
+    return None
+
+
+def _job_runner_for_type(job_type: str):
+    """Return the single-job runner for a given job type."""
+    if job_type == "record":
+        return _run_single_record
+    return _run_single_pov
+
+
+def _run_batch(args, command: str, run_single_job=None) -> int:
+    """Run single or batch jobs with config support.
+
+    Args:
+        args: Parsed argparse namespace
+        command: Command name for error messages
+        run_single_job: Callable(args) -> int for single job. If None,
+            dispatches per job using the job's 'type' field from config.
+    """
+    from copy import copy
+
+    # Load config
+    try:
+        config_path = find_config(getattr(args, "config", None))
+        project = load_config(config_path) if config_path else None
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 1
+
+    config_dir = config_path.parent if config_path else Path.cwd()
+
+    # Determine job list and per-job types
+    job_types: list[str] = []
+    if project and project.jobs and getattr(args, "demo", None) is None:
+        # Batch mode: use jobs from config
+        job_types = [j.type for j in project.jobs]
+        jobs = [resolve_job(j, project.defaults) for j in project.jobs]
+        jobs = [resolve_paths(j, config_dir) for j in jobs]
+        print(f"Running {len(jobs)} jobs from {config_path.name}\n")
+    else:
+        # Single mode: config defaults + CLI args
+        jobs = [project.defaults.copy() if project else {}]
+        job_types = [command]  # Use the command as the type
+        if project:
+            jobs[0] = resolve_paths(jobs[0], config_dir)
+
+    results: list[tuple[int, str, Optional[str]]] = []  # (index, demo_name, error)
+
+    for i, job in enumerate(jobs):
+        merged = merge_args_with_config(copy(args), job)
+        job_type = job_types[i]
+
+        # Validate required fields
+        err = _validate_required_args(merged, job_type)
+        if err:
+            if len(jobs) == 1:
+                print(f"Error: {err}", file=sys.stderr)
+                if project:
+                    print(f"Hint: Add jobs to {config_path.name} or pass -d, -p, -o flags", file=sys.stderr)
+                else:
+                    print(f"Hint: Create a cs2pov.json with 'cs2pov init' or pass -d, -p, -o flags", file=sys.stderr)
+                return 1
+            demo_name = job.get("demo", f"job {i+1}")
+            print(f"[SKIP] Job {i+1}: {demo_name} - {err}")
+            results.append((i, str(demo_name), err))
+            continue
+
+        demo_name = str(merged.demo)
+        if len(jobs) > 1:
+            print(f"{'='*60}")
+            print(f"Job {i+1}/{len(jobs)}: {Path(demo_name).name} ({job_type})")
+            print(f"{'='*60}\n")
+
+        # Dispatch to the appropriate runner
+        runner = run_single_job if run_single_job else _job_runner_for_type(job_type)
+
+        try:
+            ret = runner(merged)
+            if ret == 0:
+                results.append((i, demo_name, None))
+            else:
+                results.append((i, demo_name, f"Exit code {ret}"))
+        except CS2POVError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            results.append((i, demo_name, str(e)))
+        except Exception as e:
+            print(f"Unexpected error: {e}", file=sys.stderr)
+            results.append((i, demo_name, str(e)))
+
+        # Sleep between batch jobs
+        if len(jobs) > 1 and i < len(jobs) - 1:
+            print(f"\nWaiting 10s before next job...\n")
+            time.sleep(10)
+
+    # Print batch summary
+    if len(jobs) > 1:
+        succeeded = sum(1 for _, _, err in results if err is None)
+        print(f"\n{'='*60}")
+        print(f"Batch complete: {succeeded}/{len(results)} succeeded")
+        for i, demo_name, err in results:
+            if err:
+                print(f"  [FAIL] Job {i+1}: {Path(demo_name).name} - {err}")
+        print(f"{'='*60}")
+        return 0 if succeeded == len(results) else 1
+
+    # Single job
+    if results and results[0][2] is not None:
+        return 1
+    return 0
+
+
+def cmd_init(args) -> int:
+    """Handle 'init' command - create cs2pov.json config."""
+    config_path = Path.cwd() / "cs2pov.json"
+
+    if config_path.exists():
+        print(f"Config already exists: {config_path}")
+        response = input("Overwrite? [y/N] ").strip().lower()
+        if response != "y":
+            print("Aborted.")
+            return 0
+
+    # Try to auto-detect CS2 path
+    cs2_path_str = None
+    try:
+        cs2_path = find_cs2_path()
+        cs2_path_str = str(cs2_path)
+        print(f"Detected CS2 path: {cs2_path}")
+    except CS2POVError:
+        print("CS2 path not auto-detected. You can set it manually in the config.")
+
+    config = generate_default_config(cs2_path=cs2_path_str)
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    print(f"Created {config_path}")
+    print(f"\nEdit the 'jobs' array to add your recording jobs, then run:")
+    print(f"  cs2pov pov")
+    return 0
+
 
 def cmd_info(args) -> int:
     """Handle 'info' command - show demo information."""
@@ -887,8 +1057,8 @@ def cmd_info(args) -> int:
     return 0
 
 
-def cmd_pov(args) -> int:
-    """Handle 'pov' command - full recording pipeline."""
+def _run_single_pov(args) -> int:
+    """Run a single POV recording job (record + trim)."""
     # Check dependencies
     missing = check_dependencies()
     if missing:
@@ -951,8 +1121,13 @@ def cmd_pov(args) -> int:
     return 0 if result.success else 1
 
 
-def cmd_record(args) -> int:
-    """Handle 'record' command - raw recording without trimming."""
+def cmd_pov(args) -> int:
+    """Handle 'pov' command - full recording pipeline with batch support."""
+    return _run_batch(args, "pov", _run_single_pov)
+
+
+def _run_single_record(args) -> int:
+    """Run a single raw recording job (no trim)."""
     # Check dependencies
     missing = check_dependencies()
     if missing:
@@ -1006,8 +1181,36 @@ def cmd_record(args) -> int:
     return 0 if result.success else 1
 
 
+def cmd_record(args) -> int:
+    """Handle 'record' command - raw recording with batch support."""
+    return _run_batch(args, "record", _run_single_record)
+
+
+def cmd_run(args) -> int:
+    """Handle bare 'cs2pov' command - run all jobs from config with per-job type dispatch."""
+    config_path = find_config(getattr(args, "config", None))
+    if config_path is None:
+        print("Error: No cs2pov.json config found.", file=sys.stderr)
+        print("Hint: Create one with 'cs2pov init' or specify with --config", file=sys.stderr)
+        return 1
+
+    return _run_batch(args, "pov")
+
+
 def cmd_trim(args) -> int:
     """Handle 'trim' command - post-process existing video."""
+    # Apply config defaults for verbose if not explicitly set
+    try:
+        config_path = find_config(getattr(args, "config", None))
+        if config_path:
+            project = load_config(config_path)
+            if args.verbose is None:
+                args.verbose = project.defaults.get("verbose", False)
+    except ConfigError:
+        pass  # Config errors are non-fatal for trim
+    if args.verbose is None:
+        args.verbose = False
+
     video_path = args.video.resolve()
     if not video_path.exists():
         print(f"Error: Video not found: {video_path}", file=sys.stderr)
@@ -1085,7 +1288,11 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.command == "info":
+        if args.command is None:
+            return cmd_run(args)
+        elif args.command == "init":
+            return cmd_init(args)
+        elif args.command == "info":
             return cmd_info(args)
         elif args.command == "pov":
             return cmd_pov(args)

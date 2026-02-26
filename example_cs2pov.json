@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "defaults": {
+    "resolution": "1920x1080",
+    "framerate": 60,
+    "tick_nav": true,
+    "verbose": false,
+    "cs2_path": "/path/to/Counter-Strike Global Offensive"
+  },
+  "jobs": [
+    {
+      "type": "pov",
+      "demo": "./demos/match1.dem",
+      "player": "PlayerName",
+      "output": "./recordings/match1_pov.mp4"
+    },
+    {
+      "type": "record",
+      "demo": "./demos/match2.dem",
+      "player": "PlayerName",
+      "output": "./recordings/match2_raw.mp4"
+    },
+    {
+      "demo": "./demos/match3.dem",
+      "player": "PlayerName",
+      "output": "./recordings/match3_pov.mp4",
+      "no_hud": true,
+      "tick_nav": false
+    }
+  ]
+}
