@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
-from .automation import send_key, check_demo_ended, wait_for_cs2_window, wait_for_demo_ready, parse_demo_end_info
+from .automation import send_key, send_console_command, check_demo_ended, wait_for_cs2_window, wait_for_demo_ready, parse_demo_end_info
 from .loading import LoadingAnimation
 from .capture import FFmpegCapture, get_default_audio_monitor
 from .config import RecordingConfig, generate_recording_cfg
@@ -27,7 +27,6 @@ from .game import CS2Process, find_cs2_path, get_cfg_dir, get_demo_dir
 from .navigation import GotoTransition, NavigationState, recording_loop_tick_nav
 from .parser import DemoInfo, PlayerInfo, find_player, get_player_index, parse_demo
 from .preprocessor import DemoTimeline, preprocess_demo, get_trim_periods
-from .trim import extract_death_periods
 
 
 # =============================================================================
@@ -40,8 +39,6 @@ class RecordingResult:
     success: bool
     video_path: Path
     console_log_path: Path
-    recording_start_time: float
-    player_slot: int
     exit_reason: str  # "demo_ended", "timeout", "ffmpeg_stopped", "interrupted", "segments_complete"
     timeline: Optional[DemoTimeline] = None
     transitions: Optional[list[GotoTransition]] = None
@@ -183,7 +180,7 @@ def record_demo(
             print(f"  Total alive time: {total_alive:.1f}s")
     except Exception as e:
         print(f"  Warning: Preprocessing failed: {e}")
-        print(f"  Will fall back to console.log parsing for trim")
+        print(f"  Trimming will be skipped (no timeline data)")
         timeline = None
 
     # Prepare directories
@@ -237,7 +234,6 @@ def record_demo(
 
     cs2_process: Optional[CS2Process] = None
     ffmpeg: Optional[FFmpegCapture] = None
-    recording_start_time = 0.0
     exit_reason = "unknown"
 
     try:
@@ -260,6 +256,13 @@ def record_demo(
         else:
             print("  Warning: CS2 window not detected, continuing anyway")
 
+        # Determine tick-nav mode early (needed for startup sequence)
+        use_tick_nav = (
+            tick_nav
+            and timeline is not None
+            and timeline.alive_segments
+        )
+
         # Wait for demo to be ready
         print("  Waiting for demo to load...")
         if wait_for_demo_ready(console_log_path, timeout=180):
@@ -267,11 +270,13 @@ def record_demo(
             if verbose:
                 print("  Waiting 20s before hiding demo UI...")
             time.sleep(20)
-            if window_id and send_key("shift+F2", display_str, window_id):
-                if verbose:
-                    print("  Sent Shift+F2 to hide demo UI")
-            elif window_id:
-                print("  Warning: Failed to send Shift+F2 to hide demo UI")
+            # In tick-nav mode, defer Shift+F2 until after the seek (gototick resets UI state)
+            if not use_tick_nav:
+                if window_id and send_key("shift+F2", display_str, window_id):
+                    if verbose:
+                        print("  Sent Shift+F2 to hide demo UI")
+                elif window_id:
+                    print("  Warning: Failed to send Shift+F2 to hide demo UI")
         else:
             print("  Warning: Demo ready state not detected, continuing anyway")
 
@@ -284,6 +289,24 @@ def record_demo(
                     print(f"  Audio device: {audio_source}")
             else:
                 print("  Warning: Could not detect audio device, recording video only")
+
+        # In tick-nav mode: pause, seek to first segment, then start FFmpeg
+        # This synchronizes the demo clock with the recording clock from frame 1
+        if use_tick_nav and window_id:
+            first_tick = timeline.alive_segments[0].start_tick
+            if verbose:
+                print(f"  Tick-nav: seeking to first segment start tick {first_tick}")
+            send_key("F7", display_str, window_id)  # Pause demo
+            time.sleep(0.5)
+            send_console_command(f"demo_gototick {first_tick}", display_str, window_id)
+            time.sleep(2.0)  # Wait for seek to complete
+            send_key("F5", display_str, window_id)  # Re-lock spectator
+            # Send Shift+F2 after seek (gototick resets UI state, swallowing earlier sends)
+            if send_key("shift+F2", display_str, window_id):
+                if verbose:
+                    print("  Sent Shift+F2 to hide demo UI")
+            else:
+                print("  Warning: Failed to send Shift+F2 to hide demo UI")
 
         # Start FFmpeg capture
         ffmpeg = FFmpegCapture(
@@ -300,20 +323,17 @@ def record_demo(
         else:
             print(f"  FFmpeg capture started (video only)")
 
-        recording_start_time = time.time()
-        transitions = None
+        # Unpause after FFmpeg is rolling (tick-nav only)
+        if use_tick_nav and window_id:
+            send_key("F6", display_str, window_id)  # Resume demo
+            if verbose:
+                print("  Tick-nav: demo unpaused, recording synchronized")
 
-        # Use tick-based navigation if enabled and timeline available
-        use_tick_nav = (
-            tick_nav
-            and timeline is not None
-            and timeline.alive_segments
-        )
+        transitions = None
 
         if use_tick_nav:
             nav_state = NavigationState(
                 timeline=timeline,
-                player_slot=player_slot - 1,  # Convert 1-based spec slot to 0-based console slot
             )
             exit_reason, transitions = recording_loop_tick_nav(
                 display=display_str,
@@ -370,8 +390,6 @@ def record_demo(
         success=success,
         video_path=output_path,
         console_log_path=console_log_path,
-        recording_start_time=recording_start_time,
-        player_slot=player_index,
         exit_reason=exit_reason,
         timeline=timeline,
         transitions=transitions,
@@ -381,8 +399,6 @@ def record_demo(
 def postprocess_video(
     video_path: Path,
     console_log_path: Path,
-    player_slot: int,
-    recording_start_time: float,
     verbose: bool = False,
     timeline: Optional[DemoTimeline] = None,
     startup_time_override: Optional[float] = None,
@@ -399,6 +415,7 @@ def postprocess_video(
     3. Extract and concatenate only the alive segments
 
     Args:
+        console_log_path: Path to console log (used for demo end detection/duration)
         startup_time_override: If provided, use this value instead of calculating
             startup_time. Useful when the automatic calculation is wrong.
         transitions: If provided, use transition-based trimming (from --tick-nav)
@@ -528,52 +545,6 @@ def postprocess_video(
                 video_segments.append((video_start, video_end))
                 if verbose:
                     print(f"  Keep: {video_start:.2f}s - {video_end:.2f}s ({video_end - video_start:.2f}s)")
-
-    # Fall back to console.log parsing (legacy method)
-    if not video_segments:
-        if timeline is not None:
-            print("  No alive segments found, falling back to console.log")
-        else:
-            print("  Using console.log parsing (legacy method)")
-
-        if verbose:
-            print(f"  Console log: {console_log_path}")
-            print(f"  Player slot: {player_slot}")
-            print(f"  Recording start: {recording_start_time}")
-
-        if not console_log_path.exists():
-            print("  Console log not found, skipping trim")
-            print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
-            return video_path
-
-        # Use legacy death period extraction
-        death_periods = extract_death_periods(
-            log_path=console_log_path,
-            player_slot=player_slot,
-            recording_start_time=recording_start_time,
-            verbose=verbose
-        )
-
-        if death_periods:
-            # Convert death periods to video segments (inverse)
-            try:
-                video_duration = get_video_duration(video_path)
-            except Exception as e:
-                print(f"  Error getting video duration: {e}")
-                return video_path
-
-            # Sort death periods and compute alive segments
-            death_periods_sorted = sorted(death_periods, key=lambda p: p.death_time)
-            current_pos = 0.0
-
-            for dp in death_periods_sorted:
-                if dp.death_time > current_pos:
-                    video_segments.append((current_pos, dp.death_time))
-                current_pos = max(current_pos, dp.respawn_time)
-
-            # Add final segment
-            if current_pos < video_duration:
-                video_segments.append((current_pos, video_duration))
 
     # Execute trimming
     if video_segments:
@@ -837,13 +808,6 @@ Examples:
     trim_parser.add_argument("video", type=Path, help="Input video file")
     trim_parser.add_argument("-o", "--output", type=Path,
                              help="Output file (default: adds _trimmed suffix)")
-    # Fallback options
-    trim_parser.add_argument("--console-log", type=Path,
-                             help="Console.log file (fallback when demo unavailable)")
-    trim_parser.add_argument("--player-slot", type=int,
-                             help="Player slot, 0-based (fallback)")
-    trim_parser.add_argument("--recording-start-time", type=float,
-                             help="Recording start timestamp (fallback)")
     trim_parser.add_argument("--startup-time", type=float,
                              help="Override startup time (seconds from video start to demo start)")
 
@@ -933,8 +897,6 @@ def cmd_pov(args) -> int:
             postprocess_video(
                 video_path=result.video_path,
                 console_log_path=result.console_log_path,
-                player_slot=result.player_slot,
-                recording_start_time=result.recording_start_time,
                 verbose=args.verbose,
                 timeline=result.timeline,
                 transitions=result.transitions,
@@ -1029,7 +991,6 @@ def cmd_trim(args) -> int:
         try:
             demo_info = parse_demo(demo_path)
             player = find_player(demo_info, args.player)
-            player_slot = get_player_index(demo_info, player)
         except CS2POVError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -1042,20 +1003,10 @@ def cmd_trim(args) -> int:
             print(f"  {len(timeline.alive_segments)} alive segments to keep")
         except Exception as e:
             print(f"Warning: Could not preprocess demo: {e}")
-            print("Falling back to console.log method")
 
-        # Validate fallback parameters if needed
         if timeline is None:
-            if args.console_log is None:
-                print("Error: --console-log required when demo preprocessing fails", file=sys.stderr)
-                return 1
-            if args.player_slot is None:
-                print("Error: --player-slot required when demo preprocessing fails", file=sys.stderr)
-                return 1
-            if args.recording_start_time is None:
-                print("Error: --recording-start-time required when demo preprocessing fails", file=sys.stderr)
-                return 1
-            player_slot = args.player_slot
+            print("Error: Demo preprocessing failed, cannot trim without timeline data", file=sys.stderr)
+            return 1
 
         # Copy video to output path first (postprocess_video expects to rename)
         if video_path != output_path:
@@ -1064,9 +1015,7 @@ def cmd_trim(args) -> int:
         # Run trimming
         postprocess_video(
             video_path=output_path,
-            console_log_path=args.console_log.resolve() if args.console_log else Path("/dev/null"),
-            player_slot=player_slot,
-            recording_start_time=args.recording_start_time or 0.0,
+            console_log_path=Path("/dev/null"),
             verbose=args.verbose,
             timeline=timeline,
             startup_time_override=args.startup_time,
