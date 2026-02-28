@@ -765,17 +765,21 @@ Examples:
                                 help="X display number (default: 0)")
     recording_args.add_argument("--no-hud", action="store_true", default=None,
                                 help="Hide HUD elements")
+    recording_args.add_argument("--hud", action="store_false", dest="no_hud",
+                                help="Show HUD (override config no_hud)")
     recording_args.add_argument("--no-audio", action="store_true", default=None,
                                 help="Disable audio recording")
+    recording_args.add_argument("--audio", action="store_false", dest="no_audio",
+                                help="Enable audio (override config no_audio)")
     recording_args.add_argument("--audio-device", default=None,
                                 help="PulseAudio device (auto-detected)")
     recording_args.add_argument("--cs2-path", type=Path, default=None,
                                 help="Custom CS2 installation path")
-    recording_args.add_argument("--tick-nav", action="store_true", default=None,
+    recording_args.add_argument("--tick-nav", action=argparse.BooleanOptionalAction, default=None,
                                 help="Enable tick-based navigation (skip deaths in real-time)")
 
     verbose_args = argparse.ArgumentParser(add_help=False)
-    verbose_args.add_argument("-v", "--verbose", action="store_true", default=None,
+    verbose_args.add_argument("-v", "--verbose", action=argparse.BooleanOptionalAction, default=None,
                               help="Verbose output")
 
     # INFO command
@@ -798,6 +802,8 @@ Examples:
     )
     pov_parser.add_argument("--no-trim", action="store_true", default=None,
                             help="Skip post-processing trim")
+    pov_parser.add_argument("--trim", action="store_false", dest="no_trim",
+                            help="Enable trimming (override config no_trim)")
 
     # RECORD command
     subparsers.add_parser(
@@ -1156,22 +1162,39 @@ def cmd_run(args) -> int:
         print("Hint: Create one with 'cs2pov init' or specify with --config", file=sys.stderr)
         return 1
 
+    project = load_config(config_path)
+    if not project.jobs:
+        print(f"Error: No jobs defined in {config_path.name}", file=sys.stderr)
+        print("Hint: Add jobs to the 'jobs' array in your config file", file=sys.stderr)
+        return 1
+
     return _run_batch(args, "pov")
 
 
-def cmd_trim(args) -> int:
-    """Handle 'trim' command - post-process existing video."""
-    # Apply config defaults for verbose if not explicitly set
+def _apply_config_defaults(args) -> None:
+    """Apply config defaults to args for commands that don't use _run_batch.
+
+    Non-fatal: config errors are silently ignored.
+    """
     try:
         config_path = find_config(getattr(args, "config", None))
         if config_path:
             project = load_config(config_path)
-            if args.verbose is None:
-                args.verbose = project.defaults.get("verbose", False)
+            for key, value in project.defaults.items():
+                if key in HARDCODED_DEFAULTS and getattr(args, key, None) is None:
+                    setattr(args, key, value)
     except ConfigError:
-        pass  # Config errors are non-fatal for trim
-    if args.verbose is None:
-        args.verbose = False
+        pass
+
+    # Fill remaining None values with hardcoded defaults
+    for key, value in HARDCODED_DEFAULTS.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, value)
+
+
+def cmd_trim(args) -> int:
+    """Handle 'trim' command - post-process existing video."""
+    _apply_config_defaults(args)
 
     video_path = args.video.resolve()
     if not video_path.exists():

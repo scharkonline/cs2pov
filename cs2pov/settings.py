@@ -31,14 +31,14 @@ HARDCODED_DEFAULTS: dict[str, Any] = {
     "verbose": False,
 }
 
-# Keys valid in "defaults" and as job overrides
-VALID_DEFAULT_KEYS = set(HARDCODED_DEFAULTS.keys())
+# Keys valid in "defaults" and as job overrides (includes per-job fields that can be defaulted)
+VALID_DEFAULT_KEYS = set(HARDCODED_DEFAULTS.keys()) | {"player", "demo", "output"}
 
-# Keys required in each job
-REQUIRED_JOB_KEYS = {"demo", "player", "output"}
+# Keys required after merging job with defaults (not per-job — defaults can provide them)
+REQUIRED_MERGED_KEYS = {"demo", "player", "output"}
 
-# Keys valid in a job entry (required + overridable + job-only)
-VALID_JOB_KEYS = REQUIRED_JOB_KEYS | VALID_DEFAULT_KEYS | {"type"}
+# Keys valid in a job entry
+VALID_JOB_KEYS = REQUIRED_MERGED_KEYS | VALID_DEFAULT_KEYS | {"type"}
 
 # Valid job types
 VALID_JOB_TYPES = {"pov", "record"}
@@ -50,9 +50,9 @@ CURRENT_VERSION = 1
 @dataclass
 class JobConfig:
     """A single recording job from config."""
-    demo: str
-    player: str
-    output: str
+    demo: Optional[str] = None
+    player: Optional[str] = None
+    output: Optional[str] = None
     type: str = "pov"
     overrides: dict[str, Any] = field(default_factory=dict)
 
@@ -127,10 +127,6 @@ def load_config(path: Path) -> ProjectConfig:
         if not isinstance(job_raw, dict):
             raise ConfigError(f"Job {i+1} must be an object")
 
-        missing = REQUIRED_JOB_KEYS - set(job_raw.keys())
-        if missing:
-            raise ConfigError(f"Job {i+1} missing required keys: {', '.join(sorted(missing))}")
-
         unknown = set(job_raw.keys()) - VALID_JOB_KEYS
         if unknown:
             raise ConfigError(f"Job {i+1} has unknown keys: {', '.join(sorted(unknown))}")
@@ -144,13 +140,14 @@ def load_config(path: Path) -> ProjectConfig:
                 f"Job {i+1}: invalid type '{job_type}', must be one of: {', '.join(sorted(VALID_JOB_TYPES))}"
             )
 
-        overrides = {k: v for k, v in job_raw.items() if k not in REQUIRED_JOB_KEYS and k != "type"}
+        overrides = {k: v for k, v in job_raw.items()
+                     if k not in REQUIRED_MERGED_KEYS and k != "type"}
         _validate_setting_types(overrides, f"job {i+1}")
 
         jobs.append(JobConfig(
-            demo=job_raw["demo"],
-            player=job_raw["player"],
-            output=job_raw["output"],
+            demo=job_raw.get("demo"),
+            player=job_raw.get("player"),
+            output=job_raw.get("output"),
             type=job_type,
             overrides=overrides,
         ))
@@ -176,6 +173,9 @@ def _validate_setting_types(settings: dict[str, Any], context: str) -> None:
         "tick_nav": (bool,),
         "no_trim": (bool,),
         "verbose": (bool,),
+        "player": (str,),
+        "demo": (str,),
+        "output": (str,),
     }
 
     for key, value in settings.items():
@@ -191,9 +191,13 @@ def resolve_job(job: JobConfig, defaults: dict[str, Any]) -> dict[str, Any]:
     """Merge job overrides onto defaults. Returns flat dict with all keys."""
     merged = dict(defaults)
     merged.update(job.overrides)
-    merged["demo"] = job.demo
-    merged["player"] = job.player
-    merged["output"] = job.output
+    # Job fields override defaults (only set if job provides them)
+    if job.demo is not None:
+        merged["demo"] = job.demo
+    if job.player is not None:
+        merged["player"] = job.player
+    if job.output is not None:
+        merged["output"] = job.output
     return merged
 
 
