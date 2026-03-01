@@ -42,10 +42,10 @@ VALID_DEFAULT_KEYS = set(HARDCODED_DEFAULTS.keys()) | {"player", "demo", "output
 REQUIRED_MERGED_KEYS = {"demo", "player", "output"}
 
 # Keys valid in a job entry
-VALID_JOB_KEYS = REQUIRED_MERGED_KEYS | VALID_DEFAULT_KEYS | {"type", "video", "audio", "no_trim_sync"}
+VALID_JOB_KEYS = REQUIRED_MERGED_KEYS | VALID_DEFAULT_KEYS | {"type", "video", "audio", "no_trim_sync", "startup_time"}
 
 # Valid job types
-VALID_JOB_TYPES = {"pov", "record", "comms"}
+VALID_JOB_TYPES = {"pov", "record", "comms", "trim"}
 
 CONFIG_FILENAME = "cs2pov.json"
 CURRENT_VERSION = 1
@@ -180,6 +180,8 @@ def _validate_setting_types(settings: dict[str, Any], context: str) -> None:
         "player": (str,),
         "demo": (str,),
         "output": (str,),
+        "video": (str,),
+        "startup_time": (int, float, type(None)),
     }
 
     for key, value in settings.items():
@@ -209,7 +211,7 @@ def resolve_paths(job_dict: dict[str, Any], config_dir: Path) -> dict[str, Any]:
     """Make relative paths in job_dict absolute against config_dir."""
     result = dict(job_dict)
 
-    for key in ("demo", "output"):
+    for key in ("demo", "output", "video"):
         if key in result and result[key] is not None:
             p = Path(result[key])
             if not p.is_absolute():
@@ -288,6 +290,14 @@ def generate_default_config(cs2_path: Optional[str] = None) -> dict:
                 "comms_r1_sync_time": 0.0,
                 "comms_volume": 1.0,
                 "game_volume": 0.7,
+            },
+            {
+                "type": "trim",
+                "video": "./recordings/example_raw.mp4",
+                "demo": "./demos/example.dem",
+                "player": "PlayerName",
+                "output": "./recordings/example_trimmed.mp4",
+                "startup_time": None,
             },
         ],
     }

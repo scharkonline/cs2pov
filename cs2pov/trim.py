@@ -1,10 +1,75 @@
 """Post-processing: trim segments from recorded video."""
 
+import json
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 from .exceptions import CaptureError
+
+
+def _transitions_path(video_path: Path) -> Path:
+    """Return the sidecar transitions JSON path for a video."""
+    return video_path.parent / f"{video_path.stem}_transitions.json"
+
+
+def save_transitions(transitions: list, video_path: Path) -> Path:
+    """Save GotoTransition list to a sidecar JSON file alongside the video.
+
+    Args:
+        transitions: List of GotoTransition objects
+        video_path: Path to the video file
+
+    Returns:
+        Path to the saved transitions file
+    """
+    path = _transitions_path(video_path)
+    data = [
+        {
+            "pause_video_time": t.pause_video_time,
+            "unpause_video_time": t.unpause_video_time,
+            "from_tick": t.from_tick,
+            "to_tick": t.to_tick,
+        }
+        for t in transitions
+    ]
+    path.write_text(json.dumps(data, indent=2))
+    return path
+
+
+def load_transitions(video_path: Path) -> Optional[list]:
+    """Load GotoTransition list from a sidecar JSON file.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        List of GotoTransition objects, or None if no sidecar file exists
+    """
+    from .navigation import GotoTransition
+
+    path = _transitions_path(video_path)
+    if not path.exists():
+        return None
+
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if not isinstance(data, list) or not data:
+        return None
+
+    return [
+        GotoTransition(
+            pause_video_time=t["pause_video_time"],
+            unpause_video_time=t["unpause_video_time"],
+            from_tick=t["from_tick"],
+            to_tick=t["to_tick"],
+        )
+        for t in data
+    ]
 
 
 def get_video_duration(video_path: Path) -> float:
@@ -46,7 +111,7 @@ def trim_goto_transitions(
     output_path: Path,
     transitions: list,
     verbose: bool = False,
-) -> bool:
+) -> Optional[list[tuple[float, float]]]:
     """Trim goto transition artifacts from a tick-nav recording.
 
     When using tick-based navigation, each death triggers a pause/seek/unpause
@@ -63,12 +128,12 @@ def trim_goto_transitions(
         verbose: Print debug output
 
     Returns:
-        True if trimming was performed, False on failure or nothing to trim
+        List of keep segments on success, None on failure or nothing to trim
     """
     if not transitions:
         if verbose:
             print("    [Trim] No transitions to trim")
-        return False
+        return None
 
     # Get video duration
     try:
@@ -76,7 +141,7 @@ def trim_goto_transitions(
     except CaptureError as e:
         if verbose:
             print(f"    [Trim] Failed to get video duration: {e}")
-        return False
+        return None
 
     # Build keep segments from the gaps between transitions
     keep_segments: list[tuple[float, float]] = []
@@ -100,7 +165,7 @@ def trim_goto_transitions(
     if not keep_segments:
         if verbose:
             print("    [Trim] No segments to keep after transition removal")
-        return False
+        return None
 
     if verbose:
         total_keep = sum(end - start for start, end in keep_segments)
@@ -108,7 +173,8 @@ def trim_goto_transitions(
         print(f"    [Trim] {len(transitions)} transitions → {len(keep_segments)} keep segments")
         print(f"    [Trim] Keep: {total_keep:.1f}s, Trim: {total_trim:.1f}s")
 
-    return extract_and_concat_segments(input_path, output_path, keep_segments, verbose)
+    success = extract_and_concat_segments(input_path, output_path, keep_segments, verbose)
+    return keep_segments if success else None
 
 
 def extract_and_concat_segments(
@@ -228,3 +294,78 @@ def extract_and_concat_segments(
             print(f"    [Trim] Output video: {output_duration:.2f}s")
 
     return True
+
+
+def reconstruct_transitions(alive_segments, video_duration: float) -> list:
+    """Reconstruct GotoTransitions from alive segment durations and video duration.
+
+    For tick-nav recordings without a sidecar file, we know:
+    - Each alive segment played for its full duration
+    - Between segments are goto artifacts of unknown but uniform duration
+    - total_artifact_time = video_duration - sum(segment durations)
+
+    Args:
+        alive_segments: List of AliveSegment objects from DemoTimeline
+        video_duration: Total video duration in seconds
+
+    Returns:
+        List of GotoTransition objects (empty if <= 1 segment)
+    """
+    from .navigation import GotoTransition
+
+    if len(alive_segments) <= 1:
+        return []
+
+    total_segment_time = sum(
+        seg.end_time - seg.start_time for seg in alive_segments
+    )
+    num_gaps = len(alive_segments) - 1
+    total_artifact_time = max(0.0, video_duration - total_segment_time)
+    artifact_per_gap = total_artifact_time / num_gaps
+
+    transitions = []
+    pos = 0.0
+    for i, seg in enumerate(alive_segments[:-1]):
+        seg_duration = seg.end_time - seg.start_time
+        pause_time = pos + seg_duration
+        unpause_time = pause_time + artifact_per_gap
+        transitions.append(GotoTransition(
+            pause_video_time=pause_time,
+            unpause_video_time=unpause_time,
+            from_tick=seg.end_tick,
+            to_tick=alive_segments[i + 1].start_tick,
+        ))
+        pos = unpause_time
+
+    return transitions
+
+
+def compute_keep_segments(
+    alive_segments,
+    video_duration: float,
+    demo_duration: float,
+    startup_time_override: Optional[float] = None,
+) -> list[tuple[float, float]]:
+    """Convert alive segments to video-time keep segments.
+
+    Args:
+        alive_segments: List of AliveSegment objects from DemoTimeline
+        video_duration: Total video duration in seconds
+        demo_duration: Total demo duration in seconds
+        startup_time_override: Manual startup time override
+
+    Returns:
+        List of (start, end) tuples in video time (seconds)
+    """
+    if startup_time_override is not None:
+        startup_time = startup_time_override
+    else:
+        startup_time = max(0.0, video_duration - demo_duration)
+
+    segments = []
+    for seg in alive_segments:
+        start = max(0.0, startup_time + seg.start_time)
+        end = min(video_duration, startup_time + seg.end_time)
+        if end > start + 0.5:
+            segments.append((start, end))
+    return segments

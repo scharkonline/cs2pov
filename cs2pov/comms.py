@@ -5,13 +5,16 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .preprocessor import AliveSegment, DemoTimeline
+from .preprocessor import AliveSegment, DemoTimeline, RoundBoundary
 
 
 def compute_comms_segments(
     alive_segments: list[AliveSegment],
+    rounds: list[RoundBoundary],
     round1_freeze_end_time: float,
     r1_sync_time: float = 0.0,
+    tick_nav: bool = False,
+    keep_durations: Optional[list[float]] = None,
 ) -> list[tuple[float, float]]:
     """Map alive segments from demo time to comms audio time.
 
@@ -19,18 +22,48 @@ def compute_comms_segments(
     r1_sync_time is the timestamp in the comms audio where round 1 starts.
     Segments before comms t=0 are clamped or dropped.
 
+    When keep_durations is provided (from trim's actual keep segments), those
+    durations override the computed end times. This ensures comms segments
+    match the exact durations in the trimmed video.
+
+    When tick_nav=True and keep_durations is not available, segment end times
+    are extended to match the actual navigation behavior as a fallback.
+
     Args:
         alive_segments: Alive segments from DemoTimeline
+        rounds: Round boundaries from DemoTimeline
         round1_freeze_end_time: Demo time (seconds) of round 1 freeze end
         r1_sync_time: Seconds into comms audio where round 1 begins
+        tick_nav: Whether tick-nav mode was used (extends segment boundaries)
+        keep_durations: Durations from trim's actual keep segments (overrides end time calc)
 
     Returns:
         List of (start, end) tuples in comms audio time (seconds)
     """
     segments = []
-    for seg in alive_segments:
+    for i, seg in enumerate(alive_segments):
         comms_start = seg.start_time - round1_freeze_end_time + r1_sync_time
-        comms_end = seg.end_time - round1_freeze_end_time + r1_sync_time
+
+        if keep_durations and i < len(keep_durations):
+            # Use trim's actual duration — guarantees sync with trimmed video
+            comms_end = comms_start + keep_durations[i]
+        else:
+            # Fallback: compute end from demo timeline
+            end_time = seg.end_time
+
+            if tick_nav:
+                # Match navigation.py segment duration extensions
+                if seg.reason_ended == "round_end":
+                    next_seg = alive_segments[i + 1] if i + 1 < len(alive_segments) else None
+                    if next_seg:
+                        for r in rounds:
+                            if r.round_num == next_seg.round_num and r.prestart_time is not None:
+                                end_time = r.prestart_time - 0.2
+                                break
+                elif seg.reason_ended == "death":
+                    end_time += 0.9
+
+            comms_end = end_time - round1_freeze_end_time + r1_sync_time
 
         if comms_end <= 0:
             continue
@@ -174,6 +207,7 @@ def overlay_comms_on_video(
     output_path: Path,
     game_volume: float = 1.0,
     comms_volume: float = 1.0,
+    tempo: Optional[float] = None,
     verbose: bool = False,
 ) -> bool:
     """Mix comms audio onto video's existing game audio using FFmpeg amix.
@@ -187,6 +221,7 @@ def overlay_comms_on_video(
         output_path: Output video path
         game_volume: Volume multiplier for game audio (default 1.0)
         comms_volume: Volume multiplier for comms audio (default 1.0)
+        tempo: Optional atempo correction factor (e.g. 1.005 to speed up slightly)
         verbose: Print debug info
 
     Returns:
@@ -194,11 +229,16 @@ def overlay_comms_on_video(
     """
     has_audio = _has_audio_stream(video_path)
 
+    # Build comms filter chain: volume → optional atempo
+    comms_filters = f"volume={comms_volume}"
+    if tempo is not None:
+        comms_filters += f",atempo={tempo}"
+
     if has_audio:
         # Mix game audio + comms audio
         filter_complex = (
             f"[0:a]volume={game_volume}[game];"
-            f"[1:a]volume={comms_volume}[comms];"
+            f"[1:a]{comms_filters}[comms];"
             f"[game][comms]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         )
         cmd = [
@@ -214,13 +254,14 @@ def overlay_comms_on_video(
             str(output_path),
         ]
     else:
-        # No game audio — use comms as sole audio track
+        # No game audio — apply filters to comms and use as sole audio
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video_path),
             "-i", str(comms_audio_path),
+            "-filter_complex", f"[1:a]{comms_filters}[aout]",
             "-map", "0:v",
-            "-map", "1:a",
+            "-map", "[aout]",
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "192k",
@@ -229,7 +270,8 @@ def overlay_comms_on_video(
 
     if verbose:
         mode = "mixing with game audio" if has_audio else "adding as sole audio"
-        print(f"    [Comms] Overlaying comms ({mode})")
+        tempo_info = f", atempo={tempo:.6f}" if tempo else ""
+        print(f"    [Comms] Overlaying comms ({mode}{tempo_info})")
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -255,12 +297,15 @@ def apply_comms_overlay(
     comms_volume: float = 1.0,
     is_trimmed: bool = True,
     verbose: bool = False,
+    tick_nav: bool = False,
+    keep_segments: Optional[list[tuple[float, float]]] = None,
 ) -> bool:
     """High-level entry point: trim comms to match alive segments, then overlay onto video.
 
     If the video is trimmed and a timeline is provided, the comms audio is cut
-    to match the same alive segments so it stays in sync. Otherwise, the comms
-    are overlaid directly with an offset seek.
+    to match the same alive segments so it stays in sync. When keep_segments
+    is provided (from trim's actual output), those durations are used instead
+    of recomputing from the timeline, preventing audio drift.
 
     Args:
         video_path: Input video (trimmed or raw)
@@ -272,6 +317,8 @@ def apply_comms_overlay(
         comms_volume: Comms audio volume (default 1.0)
         is_trimmed: Whether the video has been trimmed
         verbose: Print debug info
+        tick_nav: Whether tick-nav mode was used (fallback for segment extensions)
+        keep_segments: Actual keep segments from trim (overrides duration calculation)
 
     Returns:
         True on success
@@ -283,9 +330,17 @@ def apply_comms_overlay(
             print("  Warning: No round data found, using demo start as reference")
             round1_time = 0.0
 
+        # Extract durations from trim's keep segments if available
+        keep_durations = None
+        if keep_segments:
+            keep_durations = [end - start for start, end in keep_segments]
+            if verbose:
+                print(f"    [Comms] Using {len(keep_durations)} keep segment durations from trim")
+
         # Compute which parts of comms audio correspond to alive segments
         comms_segments = compute_comms_segments(
-            timeline.alive_segments, round1_time, r1_sync_time
+            timeline.alive_segments, timeline.rounds, round1_time,
+            r1_sync_time, tick_nav=tick_nav, keep_durations=keep_durations,
         )
 
         if not comms_segments:
@@ -303,10 +358,30 @@ def apply_comms_overlay(
                 print("  Error: Failed to extract comms segments")
                 return False
 
+            # Compute atempo correction for residual drift
+            tempo = None
+            try:
+                from .trim import get_video_duration
+                comms_dur = get_video_duration(trimmed_comms)
+                video_dur = get_video_duration(video_path)
+                if comms_dur > 0 and video_dur > 0 and abs(comms_dur - video_dur) > 1.0:
+                    tempo = comms_dur / video_dur
+                    if verbose:
+                        print(f"    [Comms] Atempo correction: {tempo:.6f} "
+                              f"(comms={comms_dur:.2f}s, video={video_dur:.2f}s, "
+                              f"drift={comms_dur - video_dur:+.2f}s)")
+                elif verbose:
+                    print(f"    [Comms] No atempo needed "
+                          f"(comms={comms_dur:.2f}s, video={video_dur:.2f}s, "
+                          f"drift={comms_dur - video_dur:+.2f}s)")
+            except Exception as e:
+                if verbose:
+                    print(f"    [Comms] Could not compute atempo: {e}")
+
             # Overlay trimmed comms onto trimmed video
             return overlay_comms_on_video(
                 video_path, trimmed_comms, output_path,
-                game_volume, comms_volume, verbose,
+                game_volume, comms_volume, tempo, verbose,
             )
     else:
         # Untrimmed or no timeline — overlay directly with offset

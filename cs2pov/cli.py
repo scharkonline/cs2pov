@@ -389,6 +389,12 @@ def record_demo(
             print(f"  Console log saved: {saved_log_path.name}")
             console_log_path = saved_log_path
 
+    # Save transitions sidecar for standalone trim
+    if transitions:
+        from .trim import save_transitions
+        trans_path = save_transitions(transitions, output_path)
+        print(f"  Transitions saved: {trans_path.name}")
+
     success = exit_reason in ("demo_ended", "cs2_exited", "segments_complete")
     return RecordingResult(
         success=success,
@@ -407,7 +413,7 @@ def postprocess_video(
     timeline: Optional[DemoTimeline] = None,
     startup_time_override: Optional[float] = None,
     transitions: Optional[list[GotoTransition]] = None,
-) -> Path:
+) -> tuple[Path, Optional[list[tuple[float, float]]]]:
     """Post-process a recorded video to keep only alive segments.
 
     If transitions are provided (from tick-nav recording), uses lightweight
@@ -418,20 +424,30 @@ def postprocess_video(
     2. Convert alive_segments from demo time to video time
     3. Extract and concatenate only the alive segments
 
+    Returns:
+        Tuple of (video_path, keep_segments). keep_segments is the list of
+        (start, end) tuples used for trimming, or None if no trimming occurred.
+
     Args:
         console_log_path: Path to console log (used for demo end detection/duration)
         startup_time_override: If provided, use this value instead of calculating
             startup_time. Useful when the automatic calculation is wrong.
         transitions: If provided, use transition-based trimming (from --tick-nav)
     """
-    from .trim import get_video_duration, extract_and_concat_segments, trim_goto_transitions
+    from .trim import get_video_duration, extract_and_concat_segments, trim_goto_transitions, compute_keep_segments, load_transitions
 
     if not video_path.exists():
         print(f"Error: Video file not found: {video_path}")
-        return video_path
+        return video_path, None
 
     raw_size_mb = video_path.stat().st_size / (1024 * 1024)
     print(f"\nRaw recording: {video_path} ({raw_size_mb:.1f} MB)")
+
+    # Auto-load transitions from sidecar file if not provided
+    if transitions is None:
+        transitions = load_transitions(video_path)
+        if transitions:
+            print(f"  Loaded {len(transitions)} transitions from sidecar file")
 
     # Tick-nav transition-based trimming (lightweight)
     if transitions:
@@ -440,22 +456,23 @@ def postprocess_video(
         video_path.rename(raw_path)
         print(f"  Raw recording moved to: {raw_path.name}")
 
-        success = trim_goto_transitions(
+        keep_segments = trim_goto_transitions(
             input_path=raw_path,
             output_path=video_path,
             transitions=transitions,
             verbose=verbose,
         )
 
-        if success and video_path.exists():
+        if keep_segments and video_path.exists():
             final_size_mb = video_path.stat().st_size / (1024 * 1024)
             print(f"\nFinal recording: {video_path} ({final_size_mb:.1f} MB)")
         else:
             print("\nTransition trimming failed, restoring raw recording")
             if not video_path.exists() and raw_path.exists():
                 raw_path.rename(video_path)
+            keep_segments = None
 
-        return video_path
+        return video_path, keep_segments
 
     print("\nPost-processing: calculating segments to keep...")
 
@@ -478,7 +495,7 @@ def postprocess_video(
         except Exception as e:
             print(f"  Error getting video duration: {e}")
             print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
-            return video_path
+            return video_path, None
 
         # Step 2: Get demo duration for startup_time calculation
         demo_duration = 0.0
@@ -520,35 +537,27 @@ def postprocess_video(
         if demo_duration == 0.0:
             print("  Error: Could not determine demo duration")
             print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
-            return video_path
+            return video_path, None
 
-        # Step 3: Calculate startup time (recording before demo started)
+        # Step 3: Calculate startup time and convert alive segments to video time
         if startup_time_override is not None:
-            startup_time = startup_time_override
             if verbose:
-                print(f"  Startup time: {startup_time:.2f}s (manual override)")
+                print(f"  Startup time: {startup_time_override:.2f}s (manual override)")
         else:
-            startup_time = video_duration - demo_duration
-            if startup_time < 0:
-                print(f"  Warning: Negative startup time ({startup_time:.2f}s), using 0")
-                startup_time = 0.0
+            calc_startup = video_duration - demo_duration
+            if calc_startup < 0:
+                print(f"  Warning: Negative startup time ({calc_startup:.2f}s), using 0")
             if verbose:
-                print(f"  Startup time: {startup_time:.2f}s (calculated)")
+                print(f"  Startup time: {max(0.0, video_duration - demo_duration):.2f}s (calculated)")
 
-        # Step 4: Convert alive segments to video time
-        for seg in timeline.alive_segments:
-            video_start = startup_time + seg.start_time
-            video_end = startup_time + seg.end_time
+        video_segments = compute_keep_segments(
+            timeline.alive_segments, video_duration, demo_duration,
+            startup_time_override=startup_time_override,
+        )
 
-            # Clamp to video bounds
-            video_start = max(0.0, video_start)
-            video_end = min(video_duration, video_end)
-
-            # Only include if segment has meaningful duration
-            if video_end > video_start + 0.5:
-                video_segments.append((video_start, video_end))
-                if verbose:
-                    print(f"  Keep: {video_start:.2f}s - {video_end:.2f}s ({video_end - video_start:.2f}s)")
+        if verbose:
+            for i, (vs, ve) in enumerate(video_segments):
+                print(f"  Keep: {vs:.2f}s - {ve:.2f}s ({ve - vs:.2f}s)")
 
     # Execute trimming
     if video_segments:
@@ -577,15 +586,17 @@ def postprocess_video(
         if success and video_path.exists():
             final_size_mb = video_path.stat().st_size / (1024 * 1024)
             print(f"\nFinal recording: {video_path} ({final_size_mb:.1f} MB)")
+            return video_path, video_segments
         else:
             print("\nTrimming failed, restoring raw recording")
             if not video_path.exists() and raw_path.exists():
                 raw_path.rename(video_path)
+            return video_path, None
     else:
         print("  No segments to extract, keeping original")
         print(f"\nRecording saved: {video_path} ({raw_size_mb:.1f} MB)")
 
-    return video_path
+    return video_path, None
 
 
 # =============================================================================
@@ -833,6 +844,8 @@ Examples:
                              help="Output file (default: adds _trimmed suffix)")
     trim_parser.add_argument("--startup-time", type=float,
                              help="Override startup time (seconds from video start to demo start)")
+    trim_parser.add_argument("--tick-nav", action="store_true",
+                             help="Video was recorded with --tick-nav (changes trim strategy)")
 
     # COMMS command
     comms_parser = subparsers.add_parser(
@@ -852,6 +865,8 @@ Examples:
                               help="Comms volume multiplier (default: 1.0)")
     comms_parser.add_argument("--game-volume", type=float, default=1.0,
                               help="Game audio volume multiplier (default: 1.0)")
+    comms_parser.add_argument("--tick-nav", action="store_true",
+                              help="Video was recorded with tick-nav mode (extends segment boundaries)")
     comms_parser.add_argument("--no-trim-sync", action="store_true",
                               help="Skip alive-segment sync (for untrimmed videos)")
 
@@ -880,6 +895,13 @@ def _validate_required_args(args, command: str) -> Optional[str]:
             missing.append("video")
         if getattr(args, "audio", None) is None and getattr(args, "comms_audio", None) is None:
             missing.append("audio")
+        if getattr(args, "demo", None) is None:
+            missing.append("-d/--demo")
+        if getattr(args, "player", None) is None:
+            missing.append("-p/--player")
+    elif command == "trim":
+        if getattr(args, "video", None) is None:
+            missing.append("video")
         if getattr(args, "demo", None) is None:
             missing.append("-d/--demo")
         if getattr(args, "player", None) is None:
@@ -924,12 +946,39 @@ def _run_single_comms(args) -> int:
     return cmd_comms(args)
 
 
+def _run_single_trim(args) -> int:
+    """Run a single trim job from config."""
+    video = getattr(args, "video", None)
+    if video is None:
+        print("Error: trim job requires 'video' field", file=sys.stderr)
+        return 1
+    args.video = Path(video)
+
+    # startup_time can be None (auto-detect)
+    if not hasattr(args, "startup_time"):
+        args.startup_time = None
+
+    # tick_nav defaults to False
+    if not hasattr(args, "tick_nav"):
+        args.tick_nav = False
+    elif isinstance(args.tick_nav, str):
+        args.tick_nav = args.tick_nav.lower() in ("true", "1", "yes")
+
+    # output is optional — cmd_trim generates {stem}_trimmed if unset
+    if not hasattr(args, "output") or args.output is None:
+        args.output = None
+
+    return cmd_trim(args)
+
+
 def _job_runner_for_type(job_type: str):
     """Return the single-job runner for a given job type."""
     if job_type == "record":
         return _run_single_record
     if job_type == "comms":
         return _run_single_comms
+    if job_type == "trim":
+        return _run_single_trim
     return _run_single_pov
 
 
@@ -1137,8 +1186,9 @@ def _run_single_pov(args) -> int:
         )
 
         # Post-process
+        keep_segments = None
         if result.success and not args.no_trim:
-            postprocess_video(
+            _, keep_segments = postprocess_video(
                 video_path=result.video_path,
                 console_log_path=result.console_log_path,
                 verbose=args.verbose,
@@ -1175,6 +1225,8 @@ def _run_single_pov(args) -> int:
                     comms_volume=float(getattr(args, "comms_volume", 1.0) or 1.0),
                     is_trimmed=not args.no_trim,
                     verbose=args.verbose,
+                    tick_nav=args.tick_nav,
+                    keep_segments=keep_segments,
                 )
                 if comms_ok:
                     size_mb = comms_output.stat().st_size / (1024 * 1024)
@@ -1334,14 +1386,40 @@ def cmd_trim(args) -> int:
         if video_path != output_path:
             shutil.copy2(video_path, output_path)
 
-        # Run trimming
-        postprocess_video(
-            video_path=output_path,
-            console_log_path=Path("/dev/null"),
-            verbose=args.verbose,
-            timeline=timeline,
-            startup_time_override=args.startup_time,
-        )
+        # Tick-nav path: use transitions (sidecar or reconstructed)
+        if getattr(args, "tick_nav", False):
+            from .trim import load_transitions, reconstruct_transitions, get_video_duration
+
+            transitions = load_transitions(output_path)
+            if transitions:
+                print(f"  Loaded {len(transitions)} transitions from sidecar file")
+            else:
+                video_duration = get_video_duration(output_path)
+                transitions = reconstruct_transitions(
+                    timeline.alive_segments, video_duration
+                )
+                if transitions:
+                    print(f"  Reconstructed {len(transitions)} transitions from alive segments")
+                else:
+                    print("  Only 1 alive segment, nothing to trim")
+                    return 0
+
+            postprocess_video(
+                video_path=output_path,
+                console_log_path=Path("/dev/null"),
+                verbose=args.verbose,
+                timeline=timeline,
+                transitions=transitions,
+            )
+        else:
+            # Standard path: alive-segment-based trimming
+            postprocess_video(
+                video_path=output_path,
+                console_log_path=Path("/dev/null"),
+                verbose=args.verbose,
+                timeline=timeline,
+                startup_time_override=args.startup_time,
+            )
 
     return 0
 
@@ -1392,6 +1470,39 @@ def cmd_comms(args) -> int:
             return 1
 
     from .comms import apply_comms_overlay
+    from .trim import get_video_duration, compute_keep_segments
+
+    # Recompute keep segments for standalone comms on an already-trimmed video.
+    # Skip when tick_nav=True: let compute_comms_segments use its own extension
+    # logic (death +0.9s, round_end → next prestart - 0.2s) which matches
+    # what tick-nav actually recorded.
+    keep_segments = None
+    if is_trimmed and timeline and timeline.alive_segments and not args.tick_nav:
+        try:
+            video_duration = get_video_duration(video_path)
+            # Estimate demo duration from timeline
+            demo_duration = 0.0
+            if timeline.total_duration > 0:
+                demo_duration = timeline.total_duration
+            elif timeline.rounds:
+                for r in reversed(timeline.rounds):
+                    if r.end_tick is not None:
+                        demo_duration = r.end_time + 5.0
+                        break
+            if demo_duration == 0.0 and timeline.alive_segments:
+                demo_duration = timeline.alive_segments[-1].end_time + 5.0
+
+            if demo_duration > 0:
+                keep_segments = compute_keep_segments(
+                    timeline.alive_segments, video_duration, demo_duration,
+                )
+                if args.verbose:
+                    print(f"  Recomputed {len(keep_segments)} keep segments for comms sync")
+        except Exception as e:
+            if args.verbose:
+                print(f"  Warning: Could not recompute keep segments: {e}")
+    elif args.tick_nav and args.verbose:
+        print("  Using tick-nav segment extensions (skipping keep_segments recomputation)")
 
     print(f"Overlaying comms: {comms_path.name} → {output_path.name}")
     success = apply_comms_overlay(
@@ -1404,6 +1515,8 @@ def cmd_comms(args) -> int:
         comms_volume=float(args.comms_volume),
         is_trimmed=is_trimmed,
         verbose=args.verbose,
+        tick_nav=args.tick_nav,
+        keep_segments=keep_segments,
     )
 
     if success:
