@@ -804,6 +804,14 @@ Examples:
                             help="Skip post-processing trim")
     pov_parser.add_argument("--trim", action="store_false", dest="no_trim",
                             help="Enable trimming (override config no_trim)")
+    pov_parser.add_argument("--comms-audio", type=Path, default=None,
+                            help="Comms audio file to overlay after trim")
+    pov_parser.add_argument("--comms-r1-sync-time", type=float, default=None,
+                            help="Seconds into comms audio where round 1 starts (default: 0)")
+    pov_parser.add_argument("--comms-volume", type=float, default=None,
+                            help="Comms volume multiplier (default: 1.0)")
+    pov_parser.add_argument("--game-volume", type=float, default=None,
+                            help="Game audio volume multiplier (default: 1.0)")
 
     # RECORD command
     subparsers.add_parser(
@@ -826,6 +834,27 @@ Examples:
     trim_parser.add_argument("--startup-time", type=float,
                              help="Override startup time (seconds from video start to demo start)")
 
+    # COMMS command
+    comms_parser = subparsers.add_parser(
+        "comms",
+        parents=[demo_args, player_args, verbose_args],
+        help="Overlay comms audio on recorded video",
+        description="Mix external comms audio onto a video, syncing with alive segments.",
+    )
+    comms_parser.add_argument("video", type=Path, help="Input video file")
+    comms_parser.add_argument("-a", "--audio", type=Path, required=True,
+                              help="Comms audio file (mp3/wav/flac)")
+    comms_parser.add_argument("-o", "--output", type=Path,
+                              help="Output file (default: {stem}_comms{suffix})")
+    comms_parser.add_argument("--comms-r1-sync-time", type=float, default=0.0,
+                              help="Seconds into comms audio where round 1 starts (default: 0)")
+    comms_parser.add_argument("--comms-volume", type=float, default=1.0,
+                              help="Comms volume multiplier (default: 1.0)")
+    comms_parser.add_argument("--game-volume", type=float, default=1.0,
+                              help="Game audio volume multiplier (default: 1.0)")
+    comms_parser.add_argument("--no-trim-sync", action="store_true",
+                              help="Skip alive-segment sync (for untrimmed videos)")
+
     # INIT command
     subparsers.add_parser(
         "init",
@@ -841,27 +870,66 @@ Examples:
 # =============================================================================
 
 def _validate_required_args(args, command: str) -> Optional[str]:
-    """Validate that required args (demo, player, output) are present after merging.
+    """Validate that required args are present after merging.
 
     Returns error message or None if valid.
     """
     missing = []
-    if getattr(args, "demo", None) is None:
-        missing.append("-d/--demo")
-    if getattr(args, "player", None) is None:
-        missing.append("-p/--player")
-    if getattr(args, "output", None) is None:
-        missing.append("-o/--output")
+    if command == "comms":
+        if getattr(args, "video", None) is None:
+            missing.append("video")
+        if getattr(args, "audio", None) is None and getattr(args, "comms_audio", None) is None:
+            missing.append("audio")
+        if getattr(args, "demo", None) is None:
+            missing.append("-d/--demo")
+        if getattr(args, "player", None) is None:
+            missing.append("-p/--player")
+    else:
+        if getattr(args, "demo", None) is None:
+            missing.append("-d/--demo")
+        if getattr(args, "player", None) is None:
+            missing.append("-p/--player")
+        if getattr(args, "output", None) is None:
+            missing.append("-o/--output")
 
     if missing:
         return f"Missing required arguments for '{command}': {', '.join(missing)}"
     return None
 
 
+def _run_single_comms(args) -> int:
+    """Run a single comms overlay job from config."""
+    # comms jobs require 'video' and 'audio' fields instead of 'output'
+    video = getattr(args, "video", None)
+    if video is None:
+        print("Error: comms job requires 'video' field", file=sys.stderr)
+        return 1
+    args.video = Path(video)
+
+    audio = getattr(args, "audio", None) or getattr(args, "comms_audio", None)
+    if audio is None:
+        print("Error: comms job requires 'audio' (or 'comms_audio') field", file=sys.stderr)
+        return 1
+    args.audio = Path(audio)
+
+    # Set defaults for comms-specific args
+    no_trim_sync = getattr(args, "no_trim_sync", False)
+    if isinstance(no_trim_sync, str):
+        no_trim_sync = no_trim_sync.lower() in ("true", "1", "yes")
+    args.no_trim_sync = bool(no_trim_sync)
+
+    if not hasattr(args, "comms_r1_sync_time"):
+        args.comms_r1_sync_time = 0.0
+
+    return cmd_comms(args)
+
+
 def _job_runner_for_type(job_type: str):
     """Return the single-job runner for a given job type."""
     if job_type == "record":
         return _run_single_record
+    if job_type == "comms":
+        return _run_single_comms
     return _run_single_pov
 
 
@@ -1086,6 +1154,34 @@ def _run_single_pov(args) -> int:
                 size_mb = result.video_path.stat().st_size / (1024 * 1024)
                 print(f"Partial recording available: {result.video_path} ({size_mb:.1f} MB)")
 
+        # Overlay comms audio if provided
+        comms_audio = getattr(args, "comms_audio", None) or getattr(args, "audio", None)
+        if result.success and comms_audio:
+            from .comms import apply_comms_overlay
+
+            comms_path = Path(comms_audio).resolve()
+            if not comms_path.exists():
+                print(f"Warning: Comms audio not found: {comms_path}", file=sys.stderr)
+            else:
+                comms_output = result.video_path.parent / f"{result.video_path.stem}_comms{result.video_path.suffix}"
+                print(f"\nOverlaying comms audio: {comms_path.name}")
+                comms_ok = apply_comms_overlay(
+                    video_path=result.video_path,
+                    comms_audio_path=comms_path,
+                    output_path=comms_output,
+                    timeline=result.timeline,
+                    r1_sync_time=float(getattr(args, "comms_r1_sync_time", 0.0) or 0.0),
+                    game_volume=float(getattr(args, "game_volume", 1.0) or 1.0),
+                    comms_volume=float(getattr(args, "comms_volume", 1.0) or 1.0),
+                    is_trimmed=not args.no_trim,
+                    verbose=args.verbose,
+                )
+                if comms_ok:
+                    size_mb = comms_output.stat().st_size / (1024 * 1024)
+                    print(f"Comms output: {comms_output} ({size_mb:.1f} MB)")
+                else:
+                    print("Warning: Comms overlay failed", file=sys.stderr)
+
     return 0 if result.success else 1
 
 
@@ -1250,6 +1346,76 @@ def cmd_trim(args) -> int:
     return 0
 
 
+def cmd_comms(args) -> int:
+    """Handle 'comms' command - overlay comms audio on video."""
+    _apply_config_defaults(args)
+
+    video_path = args.video.resolve()
+    if not video_path.exists():
+        print(f"Error: Video not found: {video_path}", file=sys.stderr)
+        return 1
+
+    comms_path = args.audio.resolve()
+    if not comms_path.exists():
+        print(f"Error: Audio not found: {comms_path}", file=sys.stderr)
+        return 1
+
+    # Determine output
+    if args.output:
+        output_path = args.output.resolve()
+    else:
+        output_path = video_path.parent / f"{video_path.stem}_comms{video_path.suffix}"
+
+    # Parse demo for alive segments (unless --no-trim-sync)
+    timeline = None
+    is_trimmed = not args.no_trim_sync
+
+    if is_trimmed:
+        if args.demo is None:
+            print("Error: --demo is required for trim sync (use --no-trim-sync to skip)", file=sys.stderr)
+            return 1
+        demo_path = args.demo.resolve()
+        if not demo_path.exists():
+            print(f"Error: Demo not found: {demo_path}", file=sys.stderr)
+            return 1
+        if args.player is None:
+            print("Error: --player is required for trim sync (use --no-trim-sync to skip)", file=sys.stderr)
+            return 1
+
+        try:
+            demo_info = parse_demo(demo_path)
+            player = find_player(demo_info, args.player)
+            timeline = preprocess_demo(demo_path, player.steamid, player.name)
+            print(f"  {len(timeline.alive_segments)} alive segments from timeline")
+        except CS2POVError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    from .comms import apply_comms_overlay
+
+    print(f"Overlaying comms: {comms_path.name} → {output_path.name}")
+    success = apply_comms_overlay(
+        video_path=video_path,
+        comms_audio_path=comms_path,
+        output_path=output_path,
+        timeline=timeline,
+        r1_sync_time=float(args.comms_r1_sync_time),
+        game_volume=float(args.game_volume),
+        comms_volume=float(args.comms_volume),
+        is_trimmed=is_trimmed,
+        verbose=args.verbose,
+    )
+
+    if success:
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        print(f"\nOutput: {output_path} ({size_mb:.1f} MB)")
+    else:
+        print(f"\nComms overlay failed", file=sys.stderr)
+        return 1
+
+    return 0
+
+
 # =============================================================================
 # Entry Point
 # =============================================================================
@@ -1272,6 +1438,8 @@ def main() -> int:
             return cmd_record(args)
         elif args.command == "trim":
             return cmd_trim(args)
+        elif args.command == "comms":
+            return cmd_comms(args)
         else:
             parser.print_help()
             return 1

@@ -29,6 +29,10 @@ HARDCODED_DEFAULTS: dict[str, Any] = {
     "tick_nav": False,
     "no_trim": False,
     "verbose": False,
+    "comms_audio": None,
+    "comms_r1_sync_time": 0.0,
+    "comms_volume": 1.0,
+    "game_volume": 1.0,
 }
 
 # Keys valid in "defaults" and as job overrides (includes per-job fields that can be defaulted)
@@ -38,10 +42,10 @@ VALID_DEFAULT_KEYS = set(HARDCODED_DEFAULTS.keys()) | {"player", "demo", "output
 REQUIRED_MERGED_KEYS = {"demo", "player", "output"}
 
 # Keys valid in a job entry
-VALID_JOB_KEYS = REQUIRED_MERGED_KEYS | VALID_DEFAULT_KEYS | {"type"}
+VALID_JOB_KEYS = REQUIRED_MERGED_KEYS | VALID_DEFAULT_KEYS | {"type", "video", "audio", "no_trim_sync"}
 
 # Valid job types
-VALID_JOB_TYPES = {"pov", "record"}
+VALID_JOB_TYPES = {"pov", "record", "comms"}
 
 CONFIG_FILENAME = "cs2pov.json"
 CURRENT_VERSION = 1
@@ -245,13 +249,13 @@ def merge_args_with_config(args, job_dict: dict[str, Any]):
         else:
             setattr(args, key, hardcoded)
 
-    # Set demo/player/output from job if not on CLI
-    for key in ("demo", "player", "output"):
+    # Set per-job fields from config if not on CLI
+    for key in ("demo", "player", "output", "video", "audio", "no_trim_sync"):
         cli_val = getattr(args, key, None)
         job_val = job_dict.get(key)
         if cli_val is None and job_val is not None:
-            # Convert path strings to Path objects for demo/output
-            if key in ("demo", "output"):
+            # Convert path strings to Path objects
+            if key in ("demo", "output", "video", "audio"):
                 setattr(args, key, Path(job_val))
             else:
                 setattr(args, key, job_val)
@@ -274,7 +278,17 @@ def generate_default_config(cs2_path: Optional[str] = None) -> dict:
                 "demo": "./demos/example.dem",
                 "player": "PlayerName",
                 "output": "./recordings/example.mp4",
-            }
+            },
+            {
+                "type": "comms",
+                "video": "./recordings/example.mp4",
+                "audio": "./comms/example_comms.wav",
+                "demo": "./demos/example.dem",
+                "player": "PlayerName",
+                "comms_r1_sync_time": 0.0,
+                "comms_volume": 1.0,
+                "game_volume": 0.7,
+            },
         ],
     }
 
