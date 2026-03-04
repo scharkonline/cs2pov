@@ -1502,43 +1502,31 @@ def cmd_comms(args) -> int:
                         break
 
                 if transitions:
+                    # Get raw video duration for the last keep segment
+                    raw_candidate = video_path.parent / f"{stem}_raw{video_path.suffix}" if not stem.endswith("_raw") else video_path
+                    if raw_candidate.exists():
+                        source_duration = get_video_duration(raw_candidate)
+                    else:
+                        source_duration = get_video_duration(video_path)
+
+                    # Build keep segments from transitions (same logic as trim_goto_transitions)
                     sorted_transitions = sorted(transitions, key=lambda t: t.pause_video_time)
-                    num_alive = len(timeline.alive_segments)
-                    num_trans = len(sorted_transitions)
 
-                    # Build per-alive-segment durations from transition timestamps.
-                    # transition[i] fires at end of alive_segment[i], so:
-                    #   alive[i] video_dur = transition[i].pause - transition[i-1].unpause
-                    # For alive[0]: no preceding transition (startup contaminates),
-                    #   use demo-time duration as fallback (~0.25s overrun, acceptable).
-                    per_segment_durations: list[tuple[float, float]] = []
-                    for i in range(num_alive):
-                        if i == 0 or i > num_trans or i - 1 >= num_trans:
-                            # Fallback: demo-time duration with tick_nav extensions
-                            seg = timeline.alive_segments[i]
-                            dur = seg.end_time - seg.start_time
-                            if seg.reason_ended == "death":
-                                dur += 0.9
-                            elif seg.reason_ended == "round_end":
-                                next_seg = timeline.alive_segments[i + 1] if i + 1 < num_alive else None
-                                if next_seg:
-                                    for r in timeline.rounds:
-                                        if r.round_num == next_seg.round_num and r.prestart_time is not None:
-                                            dur = r.prestart_time - 0.2 - seg.start_time
-                                            break
-                            per_segment_durations.append((0.0, dur))
-                        else:
-                            dur = sorted_transitions[i].pause_video_time - sorted_transitions[i - 1].unpause_video_time
-                            per_segment_durations.append((0.0, dur))
+                    raw_keep_segments: list[tuple[float, float]] = []
+                    current_pos = 0.0
+                    for t in sorted_transitions:
+                        if t.pause_video_time > current_pos + 0.5:
+                            raw_keep_segments.append((current_pos, t.pause_video_time))
+                        current_pos = max(current_pos, t.unpause_video_time)
+                    if current_pos < source_duration - 0.5:
+                        raw_keep_segments.append((current_pos, source_duration))
 
-                    if per_segment_durations:
-                        keep_segments = per_segment_durations
+                    if raw_keep_segments:
+                        keep_segments = raw_keep_segments
                         if args.verbose:
                             durations = [end - start for start, end in keep_segments]
-                            print(f"  Using {len(keep_segments)} per-segment durations from transitions")
-                            print(f"    Total duration: {sum(durations):.1f}s")
-                            print(f"    Segment 0 (demo-time fallback): {durations[0]:.1f}s")
-                            print(f"    Segments 1+  (transition-based): avg {sum(durations[1:])/max(len(durations)-1,1):.1f}s")
+                            print(f"  Using {len(keep_segments)} keep segment durations from transitions")
+                            print(f"    Total keep duration: {sum(durations):.1f}s")
                 elif args.verbose:
                     print("  No transitions sidecar found, falling back to tick-nav extension logic")
             except Exception as e:
