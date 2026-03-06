@@ -16,6 +16,7 @@ from .automation import (
     check_demo_ended_tick_aware,
     calibrate_tick_offset,
     find_cs2_window,
+    read_paused_tick,
     send_console_command,
     send_key,
 )
@@ -78,7 +79,13 @@ def handle_death(
     3. demo_gototick to next segment start
     4. Wait for seek to complete
     5. Re-lock spectator (F5)
-    6. Unpause (F6)
+    6. Resume briefly (F6) to let CS2 load target tick
+    7. Pause again (F7) and verify via read_paused_tick
+    8. Record unpause_video_time AFTER loading confirmed
+    9. Final resume (F6)
+
+    This ensures loading lag is inside the transition artifact (trimmed out)
+    rather than in the keep segment (causing comms drift).
 
     Args:
         state: Current navigation state
@@ -131,10 +138,33 @@ def handle_death(
     send_key("F5", display, window_id)
     time.sleep(0.3)
 
-    # Unpause
+    # Resume briefly so CS2 loads the target tick's state
     send_key("F6", display, window_id)
+    time.sleep(0.5)
 
-    unpause_video_time = time.time() - state.recording_start_time
+    # Pause again to verify CS2 has finished loading
+    send_key("F7", display, window_id)
+
+    # Wait for "paused on tick" confirmation that demo loaded target state
+    paused_tick, log_position = read_paused_tick(
+        console_log_path, log_position, timeout=5.0
+    )
+
+    if paused_tick is not None:
+        # Loading confirmed — record unpause_video_time AFTER load completes
+        send_key("F5", display, window_id)
+        time.sleep(0.1)
+        unpause_video_time = time.time() - state.recording_start_time
+        send_key("F6", display, window_id)
+        if verbose:
+            print(f"    Loading verified at tick {paused_tick}")
+    else:
+        # Timeout: F7 may not have registered, demo might still be playing.
+        # Send F6 (idempotent) to ensure playback, record time now.
+        send_key("F6", display, window_id)
+        unpause_video_time = time.time() - state.recording_start_time
+        if verbose:
+            print(f"    Warning: loading verification timed out, falling back")
 
     # Record transition
     state.transitions.append(GotoTransition(
