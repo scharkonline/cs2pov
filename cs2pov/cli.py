@@ -305,6 +305,7 @@ def record_demo(
             send_console_command(f"demo_gototick {first_tick}", display_str, window_id)
             time.sleep(2.0)  # Wait for seek to complete
             send_key("F5", display_str, window_id)  # Re-lock spectator
+            time.sleep(1.0)  # Let F5 settle before sending Shift+F2
             # Send Shift+F2 after seek (gototick resets UI state, swallowing earlier sends)
             if send_key("shift+F2", display_str, window_id):
                 if verbose:
