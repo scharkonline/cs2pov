@@ -30,7 +30,7 @@ def find_cs2_window(display: str = ":0") -> Optional[str]:
 
     try:
         result = subprocess.run(
-            ["xdotool", "search", "--class", "cs2"],
+            ["xdotool", "search", "--class", "^cs2$"],
             capture_output=True,
             text=True,
             timeout=5,
