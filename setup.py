@@ -19,6 +19,9 @@ setup(
     python_requires=">=3.10",
     packages=find_packages(),
     install_requires=requirements,
+    extras_require={
+        "gui": ["PySide6>=6.5"],
+    },
     entry_points={
         "console_scripts": [
             "cs2pov=cs2pov.cli:main",

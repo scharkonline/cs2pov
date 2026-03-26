@@ -878,6 +878,13 @@ Examples:
         description="Generate a template cs2pov.json config with defaults and example jobs.",
     )
 
+    # GUI command
+    subparsers.add_parser(
+        "gui",
+        help="Launch the graphical interface (requires PySide6)",
+        description="Open the cs2pov GUI. Install PySide6 with: pip install cs2pov[gui]",
+    )
+
     return parser
 
 
@@ -1619,6 +1626,10 @@ def main() -> int:
             return cmd_trim(args)
         elif args.command == "comms":
             return cmd_comms(args)
+        elif args.command == "gui":
+            from .gui import launch_gui
+            launch_gui()
+            return 0
         else:
             parser.print_help()
             return 1
