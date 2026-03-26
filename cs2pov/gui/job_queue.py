@@ -13,6 +13,7 @@ class JobQueuePage(QWidget):
     """Main page: scrollable job card list with add/clear/start controls."""
 
     start_requested = Signal(list)  # emits list of job dicts
+    cancel_requested = Signal()
 
     def __init__(self, demo_cache=None, parent=None):
         super().__init__(parent)
@@ -116,6 +117,28 @@ class JobQueuePage(QWidget):
         self._start_btn.clicked.connect(self._on_start)
         action_layout.addWidget(self._start_btn)
 
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setFixedHeight(36)
+        self._stop_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            "    stop:0 #f44336, stop:1 #d32f2f);"
+            "  color: white;"
+            "  font-weight: bold;"
+            "  font-size: 14px;"
+            "  border: none;"
+            "  border-radius: 6px;"
+            "  padding: 0 20px;"
+            "}"
+            "QPushButton:hover {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            "    stop:0 #ff5252, stop:1 #e53935);"
+            "}"
+        )
+        self._stop_btn.clicked.connect(self.cancel_requested.emit)
+        self._stop_btn.setVisible(False)
+        action_layout.addWidget(self._stop_btn)
+
         layout.addWidget(action_bar)
 
     def add_job(self, config: dict = None) -> JobCard:
@@ -183,6 +206,7 @@ class JobQueuePage(QWidget):
         self._clear_btn.setEnabled(not locked)
         self._start_btn.setEnabled(not locked)
         self._start_btn.setText("Running..." if locked else "Start Jobs")
+        self._stop_btn.setVisible(locked)
 
     def _on_start(self):
         if not self._cards:

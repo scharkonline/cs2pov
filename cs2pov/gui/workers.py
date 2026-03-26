@@ -121,6 +121,7 @@ class CLIJobRunner(QObject):
             json.dump(config, f, indent=2)
 
         self.message.emit(f"Config: {self._config_path}")
+        self.message.emit(json.dumps(config, indent=2))
 
         # Set up QProcess
         self._process = QProcess(self)

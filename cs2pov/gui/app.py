@@ -95,6 +95,7 @@ class MainWindow(QMainWindow):
         )
 
         self._job_queue.start_requested.connect(self._on_start_jobs)
+        self._job_queue.cancel_requested.connect(self._on_cancel)
 
         # Platform check
         if sys.platform != "linux":
@@ -161,6 +162,11 @@ class MainWindow(QMainWindow):
                 cards[index].set_status(JobStatus.SUCCESS, "Completed")
             else:
                 cards[index].set_status(JobStatus.FAILED, "Failed")
+
+    def _on_cancel(self):
+        if self._runner is not None:
+            self._log.append_line("Cancelling...")
+            self._runner.cancel()
 
     def _on_all_finished(self, succeeded: int, total: int):
         self._runner = None
