@@ -10,7 +10,7 @@ from .job_queue import JobQueuePage
 from .widgets.log_console import LogConsole
 from .widgets.demo_cache import DemoCache
 from .widgets.job_card import JobStatus
-from .workers import BatchJobWorker
+from .workers import CLIJobRunner
 
 
 def _apply_dark_theme(app):
@@ -59,7 +59,7 @@ class MainWindow(QMainWindow):
 
         _apply_dark_theme(QApplication.instance())
 
-        self._worker = None
+        self._runner = None
 
         # Shared demo cache
         self._demo_cache = DemoCache(self)
@@ -110,7 +110,7 @@ class MainWindow(QMainWindow):
         self._log.append_line(f"Parse error ({path.split('/')[-1]}): {msg}")
 
     def _on_start_jobs(self, jobs: list):
-        if not jobs or self._worker is not None:
+        if not jobs or self._runner is not None:
             return
 
         # Validate jobs
@@ -141,13 +141,12 @@ class MainWindow(QMainWindow):
         for card in cards:
             card.set_status(JobStatus.QUEUED, "Queued")
 
-        self._worker = BatchJobWorker(jobs)
-        self._worker.message.connect(self._log.append_line)
-        self._worker.job_started.connect(self._on_job_started)
-        self._worker.job_finished.connect(self._on_job_finished)
-        self._worker.job_error.connect(self._on_job_error)
-        self._worker.all_finished.connect(self._on_all_finished)
-        self._worker.start()
+        self._runner = CLIJobRunner(jobs, parent=self)
+        self._runner.message.connect(self._log.append_line)
+        self._runner.job_started.connect(self._on_job_started)
+        self._runner.job_finished.connect(self._on_job_finished)
+        self._runner.all_finished.connect(self._on_all_finished)
+        self._runner.start()
 
     def _on_job_started(self, index: int):
         cards = self._job_queue.cards()
@@ -163,13 +162,8 @@ class MainWindow(QMainWindow):
             else:
                 cards[index].set_status(JobStatus.FAILED, "Failed")
 
-    def _on_job_error(self, index: int, msg: str):
-        cards = self._job_queue.cards()
-        if 0 <= index < len(cards):
-            cards[index].set_status(JobStatus.FAILED, f"Failed: {msg}")
-
     def _on_all_finished(self, succeeded: int, total: int):
-        self._worker = None
+        self._runner = None
         self._job_queue.set_all_locked(False)
         self._log.append_line(f"\nAll done: {succeeded}/{total} jobs succeeded.")
         self._status_bar.showMessage(f"Done: {succeeded}/{total} succeeded")

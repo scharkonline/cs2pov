@@ -1,13 +1,18 @@
 """Background workers for long-running operations."""
 
 import builtins
+import json
+import os
+import re
 import sys
-import time
+import tempfile
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal, QObject
+from PySide6.QtCore import QThread, Signal, QObject, QProcess, QTimer
+
+from .config_bridge import gui_jobs_to_config
 
 
 @contextmanager
@@ -76,257 +81,168 @@ class ParseWorker(QThread):
             _set_gui_mode(False)
 
 
-class RecordWorker(QThread):
-    """Run the full recording pipeline in the background."""
+class CLIJobRunner(QObject):
+    """Run cs2pov CLI as a subprocess via QProcess.
+
+    Writes a temporary cs2pov.json config and launches
+    `python -u -m cs2pov --config <path>` to execute jobs.
+    """
 
     message = Signal(str)
-    finished = Signal(object)  # Emits RecordingResult or None
-    error = Signal(str)
+    job_started = Signal(int)        # 0-based index
+    job_finished = Signal(int, bool) # index, success
+    all_finished = Signal(int, int)  # succeeded, total
 
-    def __init__(
-        self,
-        demo_path: Path,
-        player_identifier: str,
-        output_path: Path,
-        resolution: tuple = (1920, 1080),
-        framerate: int = 60,
-        hide_hud: bool = True,
-        display_num: int = 0,
-        enable_audio: bool = True,
-        tick_nav: bool = False,
-        do_trim: bool = True,
-        cs2_path_override: Path = None,
-        verbose: bool = False,
-        parent=None,
-    ):
+    # Patterns from CLI _run_batch() output
+    _RE_JOB_HEADER = re.compile(r"^Job (\d+)/(\d+): .+ \((\w+)\)$")
+    _RE_BATCH_DONE = re.compile(r"^Batch complete: (\d+)/(\d+) succeeded$")
+    _RE_JOB_SKIP = re.compile(r"^\[SKIP\] Job (\d+):")
+    _RE_JOB_FAIL = re.compile(r"^\s+\[FAIL\] Job (\d+):")
+
+    def __init__(self, jobs: list[dict], parent=None):
         super().__init__(parent)
-        self.demo_path = demo_path
-        self.player_identifier = player_identifier
-        self.output_path = output_path
-        self.resolution = resolution
-        self.framerate = framerate
-        self.hide_hud = hide_hud
-        self.display_num = display_num
-        self.enable_audio = enable_audio
-        self.tick_nav = tick_nav
-        self.do_trim = do_trim
-        self.cs2_path_override = cs2_path_override
-        self.verbose = verbose
+        self._jobs = jobs
+        self._process: QProcess | None = None
+        self._config_path: str | None = None
+        self._current_job: int = -1
+        self._job_results: dict[int, bool] = {}  # index -> success
+        self._seen_batch_markers = False
+        self._line_buffer = ""
 
-    def run(self):
-        try:
-            from ..cli import record_demo, postprocess_video
-            from ..loading import _set_gui_mode
+    def start(self):
+        """Build config, write to temp file, launch QProcess."""
+        config = gui_jobs_to_config(self._jobs)
 
-            _set_gui_mode(True)
+        # Write config to temp file
+        fd, self._config_path = tempfile.mkstemp(
+            suffix=".json", prefix="cs2pov_gui_"
+        )
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f, indent=2)
 
-            with capture_prints(self.message.emit):
-                result = record_demo(
-                    demo_path=self.demo_path,
-                    player_identifier=self.player_identifier,
-                    output_path=self.output_path,
-                    resolution=self.resolution,
-                    framerate=self.framerate,
-                    hide_hud=self.hide_hud,
-                    display_num=self.display_num,
-                    verbose=self.verbose,
-                    cs2_path_override=self.cs2_path_override,
-                    enable_audio=self.enable_audio,
-                    tick_nav=self.tick_nav,
-                )
+        self.message.emit(f"Config: {self._config_path}")
 
-                if result.success and self.do_trim:
-                    self.message.emit("\nPost-processing: trimming death periods...")
-                    postprocess_video(
-                        video_path=result.video_path,
-                        console_log_path=result.console_log_path,
-                        verbose=self.verbose,
-                        timeline=result.timeline,
-                        transitions=result.transitions,
-                    )
+        # Set up QProcess
+        self._process = QProcess(self)
+        self._process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._process.readyReadStandardOutput.connect(self._on_output)
+        self._process.finished.connect(self._on_finished)
 
-                self.finished.emit(result)
+        # Ensure unbuffered Python output
+        env = QProcess.systemEnvironment()
+        env.append("PYTHONUNBUFFERED=1")
+        self._process.setEnvironment(env)
 
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.error.emit(f"{type(e).__name__}: {e}\n{tb}")
-        finally:
-            from ..loading import _set_gui_mode
-            _set_gui_mode(False)
+        args = ["-u", "-m", "cs2pov", "--config", self._config_path]
+        self.message.emit(f"Running: {sys.executable} {' '.join(args)}")
+        self._process.start(sys.executable, args)
 
+    def cancel(self):
+        """Terminate the subprocess."""
+        if self._process is None:
+            return
+        self._process.terminate()
+        # Force kill after 5 seconds if still running
+        QTimer.singleShot(5000, self._force_kill)
 
-class BatchJobWorker(QThread):
-    """Run a list of jobs sequentially."""
+    def _force_kill(self):
+        if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
+            self._process.kill()
 
-    message = Signal(str)
-    job_started = Signal(int)  # job index (0-based)
-    job_finished = Signal(int, bool)  # index, success
-    job_error = Signal(int, str)  # index, error_message
-    all_finished = Signal(int, int)  # succeeded_count, total_count
+    def _on_output(self):
+        """Read and parse subprocess output line by line."""
+        data = self._process.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        self._line_buffer += data
 
-    def __init__(self, jobs: list, parent=None):
-        super().__init__(parent)
-        self.jobs = jobs
+        while "\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split("\n", 1)
+            self._process_line(line)
 
-    def run(self):
-        succeeded = 0
-        last_was_recording = False
+    def _process_line(self, line: str):
+        """Parse a single output line for job progress markers."""
+        self.message.emit(line)
 
-        for i, job in enumerate(self.jobs):
+        # Job header: "Job 1/3: demo.dem (pov)"
+        m = self._RE_JOB_HEADER.match(line)
+        if m:
+            self._seen_batch_markers = True
+            job_num = int(m.group(1))
+            idx = job_num - 1  # 0-based
+
+            # Close out previous job as success (if not already failed)
+            if self._current_job >= 0 and self._current_job not in self._job_results:
+                self._job_results[self._current_job] = True
+                self.job_finished.emit(self._current_job, True)
+
+            self._current_job = idx
+            self.job_started.emit(idx)
+            return
+
+        # Job skipped: "[SKIP] Job 1: ..."
+        m = self._RE_JOB_SKIP.match(line)
+        if m:
+            self._seen_batch_markers = True
+            idx = int(m.group(1)) - 1
+            self._job_results[idx] = False
+            self.job_started.emit(idx)
+            self.job_finished.emit(idx, False)
+            return
+
+        # Job failed in summary: "  [FAIL] Job 1: ..."
+        m = self._RE_JOB_FAIL.match(line)
+        if m:
+            idx = int(m.group(1)) - 1
+            if idx not in self._job_results:
+                self._job_results[idx] = False
+                self.job_finished.emit(idx, False)
+            elif self._job_results.get(idx) is True:
+                # Was marked success but summary says fail — correct it
+                self._job_results[idx] = False
+                self.job_finished.emit(idx, False)
+            return
+
+        # Batch complete: "Batch complete: 2/3 succeeded"
+        m = self._RE_BATCH_DONE.match(line)
+        if m:
+            # Close out the last running job using the summary
+            if self._current_job >= 0 and self._current_job not in self._job_results:
+                self._job_results[self._current_job] = True
+                self.job_finished.emit(self._current_job, True)
+            return
+
+    def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus):
+        """Handle process completion."""
+        # Flush remaining buffer
+        if self._line_buffer.strip():
+            self._process_line(self._line_buffer.strip())
+            self._line_buffer = ""
+
+        total = len(self._jobs)
+
+        if not self._seen_batch_markers:
+            # Single-job case: CLI prints no Job X/Y markers
+            success = (exit_code == 0 and exit_status == QProcess.ExitStatus.NormalExit)
+            self.job_started.emit(0)
+            self._job_results[0] = success
+            self.job_finished.emit(0, success)
+        else:
+            # Close out last job if still open
+            if self._current_job >= 0 and self._current_job not in self._job_results:
+                success = (exit_code == 0)
+                self._job_results[self._current_job] = success
+                self.job_finished.emit(self._current_job, success)
+
+        succeeded = sum(1 for v in self._job_results.values() if v)
+        self.all_finished.emit(succeeded, total)
+
+        # Clean up temp config
+        if self._config_path:
             try:
-                from ..loading import _set_gui_mode
-                _set_gui_mode(True)
+                os.unlink(self._config_path)
+            except OSError:
+                pass
 
-                job_type = job["type"]
-                prefix = f"[Job {i + 1}]"
-
-                # Sleep between recording jobs to let CS2 fully exit
-                if last_was_recording and job_type in ("pov", "record"):
-                    self.message.emit(f"{prefix} Waiting 10s for CS2 to exit...")
-                    time.sleep(10)
-
-                # Platform guard for recording jobs
-                if job_type in ("pov", "record") and sys.platform != "linux":
-                    self.job_error.emit(i, "Recording only available on Linux")
-                    last_was_recording = False
-                    continue
-
-                self.job_started.emit(i)
-                self.message.emit(f"{prefix} Starting {job_type} job...")
-
-                with capture_prints(lambda msg, p=prefix: self.message.emit(f"{p} {msg}")):
-                    if job_type in ("pov", "record"):
-                        self._run_recording(job, prefix)
-                        last_was_recording = True
-                    elif job_type == "trim":
-                        self._run_trim(job, prefix)
-                        last_was_recording = False
-                    elif job_type == "comms":
-                        self._run_comms(job, prefix)
-                        last_was_recording = False
-                    else:
-                        raise ValueError(f"Unknown job type: {job_type}")
-
-                succeeded += 1
-                self.job_finished.emit(i, True)
-                self.message.emit(f"{prefix} Completed successfully.")
-
-            except Exception as e:
-                tb = traceback.format_exc()
-                self.job_error.emit(i, f"{type(e).__name__}: {e}")
-                self.message.emit(f"[Job {i + 1}] FAILED: {e}\n{tb}")
-                self.job_finished.emit(i, False)
-                last_was_recording = job.get("type") in ("pov", "record")
-            finally:
-                from ..loading import _set_gui_mode
-                _set_gui_mode(False)
-
-        self.all_finished.emit(succeeded, len(self.jobs))
-
-    def _run_recording(self, job: dict, prefix: str):
-        from ..cli import record_demo, postprocess_video
-
-        player = job.get("player")
-        if player is None:
-            raise ValueError("No player selected")
-
-        player_id = str(player.steamid)
-        demo_path = Path(job["demo_path"]).resolve()
-        output_path = Path(job["output_path"]).resolve()
-
-        result = record_demo(
-            demo_path=demo_path,
-            player_identifier=player_id,
-            output_path=output_path,
-            resolution=job.get("resolution", (1920, 1080)),
-            framerate=job.get("framerate", 60),
-            hide_hud=job.get("hide_hud", True),
-            display_num=job.get("display_num", 0),
-            enable_audio=job.get("enable_audio", True),
-            tick_nav=job.get("tick_nav", False),
-        )
-
-        if result.success and job.get("do_trim", False):
-            self.message.emit(f"{prefix} Post-processing: trimming...")
-            postprocess_video(
-                video_path=result.video_path,
-                console_log_path=result.console_log_path,
-                timeline=result.timeline,
-                transitions=result.transitions,
-            )
-
-        if not result.success:
-            raise RuntimeError(f"Recording failed: {result.exit_reason}")
-
-    def _run_trim(self, job: dict, prefix: str):
-        from ..parser import parse_demo, find_player
-        from ..preprocessor import preprocess_demo
-        from ..cli import postprocess_video
-        from ..trim import load_transitions
-
-        demo_path = Path(job["demo_path"]).resolve()
-        video_path = Path(job["video_path"]).resolve()
-
-        player = job.get("player")
-        if player is None:
-            raise ValueError("No player selected")
-
-        demo_info = parse_demo(demo_path)
-        player_info = find_player(demo_info, str(player.steamid))
-        timeline = preprocess_demo(demo_path, player_info.steamid, player_info.name)
-
-        transitions = None
-        if job.get("tick_nav"):
-            transitions = load_transitions(video_path)
-
-        output_path = job.get("output_path")
-        target = video_path
-        if output_path:
-            import shutil
-            target = Path(output_path).resolve()
-            shutil.copy2(video_path, target)
-
-        console_log_path = video_path.parent / f"console_{demo_path.stem}.log"
-
-        postprocess_video(
-            video_path=target,
-            console_log_path=console_log_path,
-            timeline=timeline,
-            startup_time_override=job.get("startup_time"),
-            transitions=transitions,
-        )
-
-    def _run_comms(self, job: dict, prefix: str):
-        from ..parser import parse_demo, find_player
-        from ..preprocessor import preprocess_demo
-        from ..comms import apply_comms_overlay
-
-        demo_path = Path(job["demo_path"]).resolve()
-        video_path = Path(job["video_path"]).resolve()
-        comms_audio_path = Path(job["comms_audio_path"]).resolve()
-
-        player = job.get("player")
-        if player is None:
-            raise ValueError("No player selected")
-
-        demo_info = parse_demo(demo_path)
-        player_info = find_player(demo_info, str(player.steamid))
-        timeline = preprocess_demo(demo_path, player_info.steamid, player_info.name)
-
-        output_path = job.get("output_path")
-        if not output_path:
-            output_path = str(video_path.parent / f"{video_path.stem}_comms{video_path.suffix}")
-        output_path = Path(output_path).resolve()
-
-        apply_comms_overlay(
-            video_path=video_path,
-            comms_audio_path=comms_audio_path,
-            output_path=output_path,
-            timeline=timeline,
-            r1_sync_time=job.get("r1_sync_time", 0.0),
-            game_volume=job.get("game_volume", 1.0),
-            comms_volume=job.get("comms_volume", 1.0),
-        )
+        self._process = None
 
 
 class TrimWorker(QThread):
