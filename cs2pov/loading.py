@@ -5,15 +5,6 @@ import sys
 import threading
 import time
 
-# GUI mode flag: when True, LoadingAnimation.start() is a no-op
-_gui_mode = False
-
-
-def _set_gui_mode(value: bool):
-    """Enable/disable GUI mode. When enabled, LoadingAnimation does nothing."""
-    global _gui_mode
-    _gui_mode = value
-
 # =============================================================================
 # Loading Messages (add more here!)
 # =============================================================================
@@ -127,8 +118,8 @@ class LoadingAnimation:
                 self._draw()
 
     def start(self):
-        """Start the animation. No-op in GUI mode."""
-        if _gui_mode:
+        """Start the animation. No-op when stderr is not a TTY (e.g. subprocess pipe)."""
+        if not sys.stderr.isatty():
             return
         self._stop_event.clear()
         self._current_dots = self.min_dots
@@ -165,7 +156,7 @@ class LoadingAnimation:
 
     def stop(self):
         """Stop the animation and clear the line."""
-        if _gui_mode:
+        if not hasattr(self, '_original_print'):
             return
         with self._lock:
             self._active = False

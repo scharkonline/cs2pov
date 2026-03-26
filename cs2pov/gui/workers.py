@@ -1,88 +1,82 @@
 """Background workers for long-running operations."""
 
-import builtins
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
-import traceback
-from contextlib import contextmanager
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
-from PySide6.QtCore import QThread, Signal, QObject, QProcess, QTimer
+from PySide6.QtCore import QThread, Signal, QObject, QTimer
 
 from .config_bridge import gui_jobs_to_config
 
 
-@contextmanager
-def capture_prints(callback):
-    """Temporarily redirect builtins.print to a callback.
-
-    Only redirects prints to stdout/None (default). Prints to stderr or
-    other file objects pass through to the original print.
-    """
-    original = builtins.print
-
-    def redirect(*args, **kwargs):
-        if kwargs.get("file") not in (None, sys.stdout):
-            original(*args, **kwargs)
-            return
-        callback(" ".join(str(a) for a in args))
-
-    builtins.print = redirect
-    try:
-        yield
-    finally:
-        builtins.print = original
-
-
 class ParseWorker(QThread):
-    """Parse a demo file in the background."""
+    """Parse a demo file by running `cs2pov info --json` as a subprocess."""
 
     message = Signal(str)
-    finished = Signal(object)  # Emits (DemoInfo, DemoTimeline | None)
+    finished = Signal(object)  # Emits (demo_info_ns, None)
     error = Signal(str)
 
     def __init__(self, demo_path: Path, player_steamid: int = None, player_name: str = "", parent=None):
         super().__init__(parent)
         self.demo_path = demo_path
-        self.player_steamid = player_steamid
-        self.player_name = player_name
 
     def run(self):
         try:
-            from ..parser import parse_demo
-            from ..preprocessor import preprocess_demo
-            from ..loading import _set_gui_mode
+            cmd = [sys.executable, "-u", "-m", "cs2pov", "info", "--json", str(self.demo_path)]
+            self.message.emit(f"Parsing demo: {self.demo_path.name}")
 
-            _set_gui_mode(True)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120
+            )
 
-            with capture_prints(self.message.emit):
-                self.message.emit(f"Parsing demo: {self.demo_path.name}")
-                demo_info = parse_demo(self.demo_path)
-                self.message.emit(
-                    f"  Map: {demo_info.map_name}, {len(demo_info.players)} players, "
-                    f"Ticks: {demo_info.total_ticks}, Rate: {demo_info.tick_rate}"
+            if result.returncode != 0:
+                stderr = result.stderr.strip() if result.stderr else "unknown error"
+                self.error.emit(f"Parse failed: {stderr}")
+                return
+
+            data = json.loads(result.stdout)
+
+            # Convert JSON dict to attribute-accessible objects matching DemoInfo interface
+            players = [
+                SimpleNamespace(
+                    name=p["name"],
+                    steamid=p["steamid"],
+                    kills=p.get("kills", 0),
+                    assists=p.get("assists", 0),
                 )
+                for p in data.get("players", [])
+            ]
 
-                timeline = None
-                if self.player_steamid is not None:
-                    self.message.emit(f"Preprocessing timeline for {self.player_name or self.player_steamid}...")
-                    timeline = preprocess_demo(self.demo_path, self.player_steamid, self.player_name)
-                    self.message.emit(f"  {len(timeline.alive_segments)} alive segments, {len(timeline.deaths)} deaths")
+            demo_info = SimpleNamespace(
+                map_name=data.get("map", ""),
+                tick_rate=data.get("tick_rate", 0),
+                total_ticks=int(data.get("duration_seconds", 0) * data.get("tick_rate", 64)),
+                players=players,
+            )
 
-                self.finished.emit((demo_info, timeline))
+            self.message.emit(
+                f"  Map: {demo_info.map_name}, {len(demo_info.players)} players, "
+                f"Tickrate: {demo_info.tick_rate}"
+            )
 
+            self.finished.emit((demo_info, None))
+
+        except subprocess.TimeoutExpired:
+            self.error.emit("Parse timed out after 120 seconds")
+        except json.JSONDecodeError as e:
+            self.error.emit(f"Failed to parse CLI output: {e}")
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}")
-        finally:
-            from ..loading import _set_gui_mode
-            _set_gui_mode(False)
 
 
 class CLIJobRunner(QObject):
-    """Run cs2pov CLI as a subprocess via QProcess.
+    """Run cs2pov CLI as a subprocess.
 
     Writes a temporary cs2pov.json config and launches
     `python -u -m cs2pov --config <path>` to execute jobs.
@@ -102,15 +96,15 @@ class CLIJobRunner(QObject):
     def __init__(self, jobs: list[dict], parent=None):
         super().__init__(parent)
         self._jobs = jobs
-        self._process: QProcess | None = None
+        self._proc: subprocess.Popen | None = None
+        self._reader_thread: threading.Thread | None = None
         self._config_path: str | None = None
         self._current_job: int = -1
         self._job_results: dict[int, bool] = {}  # index -> success
         self._seen_batch_markers = False
-        self._line_buffer = ""
 
     def start(self):
-        """Build config, write to temp file, launch QProcess."""
+        """Build config, write to temp file, launch subprocess."""
         config = gui_jobs_to_config(self._jobs)
 
         # Write config to temp file
@@ -123,41 +117,45 @@ class CLIJobRunner(QObject):
         self.message.emit(f"Config: {self._config_path}")
         self.message.emit(json.dumps(config, indent=2))
 
-        # Set up QProcess
-        self._process = QProcess(self)
-        self._process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self._process.readyReadStandardOutput.connect(self._on_output)
-        self._process.finished.connect(self._on_finished)
+        cmd = [sys.executable, "-u", "-m", "cs2pov", "--config", self._config_path]
+        self.message.emit(f"Running: {' '.join(cmd)}")
 
-        # Ensure unbuffered Python output
-        env = QProcess.systemEnvironment()
-        env.append("PYTHONUNBUFFERED=1")
-        self._process.setEnvironment(env)
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+        )
 
-        args = ["-u", "-m", "cs2pov", "--config", self._config_path]
-        self.message.emit(f"Running: {sys.executable} {' '.join(args)}")
-        self._process.start(sys.executable, args)
+        # Read output in a background thread to avoid blocking the GUI
+        self._reader_thread = threading.Thread(
+            target=self._read_output, daemon=True
+        )
+        self._reader_thread.start()
+
+    def _read_output(self):
+        """Read subprocess stdout line-by-line (runs in background thread)."""
+        try:
+            for raw_line in self._proc.stdout:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                self._process_line(line)
+        except Exception:
+            pass
+        finally:
+            exit_code = self._proc.wait()
+            self._on_finished(exit_code)
 
     def cancel(self):
         """Terminate the subprocess."""
-        if self._process is None:
+        if self._proc is None:
             return
-        self._process.terminate()
-        # Force kill after 5 seconds if still running
-        QTimer.singleShot(5000, self._force_kill)
+        self._proc.terminate()
+        # Safety net: force-kill the Python process if still alive after 10s
+        QTimer.singleShot(10000, self._force_kill)
 
     def _force_kill(self):
-        if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
-            self._process.kill()
-
-    def _on_output(self):
-        """Read and parse subprocess output line by line."""
-        data = self._process.readAllStandardOutput().data().decode("utf-8", errors="replace")
-        self._line_buffer += data
-
-        while "\n" in self._line_buffer:
-            line, self._line_buffer = self._line_buffer.split("\n", 1)
-            self._process_line(line)
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.kill()
 
     def _process_line(self, line: str):
         """Parse a single output line for job progress markers."""
@@ -211,25 +209,20 @@ class CLIJobRunner(QObject):
                 self.job_finished.emit(self._current_job, True)
             return
 
-    def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus):
+    def _on_finished(self, exit_code: int):
         """Handle process completion."""
-        # Flush remaining buffer
-        if self._line_buffer.strip():
-            self._process_line(self._line_buffer.strip())
-            self._line_buffer = ""
-
         total = len(self._jobs)
 
         if not self._seen_batch_markers:
             # Single-job case: CLI prints no Job X/Y markers
-            success = (exit_code == 0 and exit_status == QProcess.ExitStatus.NormalExit)
+            success = exit_code == 0
             self.job_started.emit(0)
             self._job_results[0] = success
             self.job_finished.emit(0, success)
         else:
             # Close out last job if still open
             if self._current_job >= 0 and self._current_job not in self._job_results:
-                success = (exit_code == 0)
+                success = exit_code == 0
                 self._job_results[self._current_job] = success
                 self.job_finished.emit(self._current_job, success)
 
@@ -243,86 +236,4 @@ class CLIJobRunner(QObject):
             except OSError:
                 pass
 
-        self._process = None
-
-
-class TrimWorker(QThread):
-    """Run post-processing trim in the background."""
-
-    message = Signal(str)
-    finished = Signal(object)  # Emits (output_path, keep_segments) or None
-    error = Signal(str)
-
-    def __init__(
-        self,
-        video_path: Path,
-        demo_path: Path,
-        player_identifier: str,
-        output_path: Path = None,
-        tick_nav: bool = False,
-        startup_time: float = None,
-        verbose: bool = False,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.video_path = video_path
-        self.demo_path = demo_path
-        self.player_identifier = player_identifier
-        self.output_path = output_path
-        self.tick_nav = tick_nav
-        self.startup_time = startup_time
-        self.verbose = verbose
-
-    def run(self):
-        try:
-            from ..parser import parse_demo, find_player
-            from ..preprocessor import preprocess_demo
-            from ..cli import postprocess_video
-            from ..trim import load_transitions
-            from ..loading import _set_gui_mode
-
-            _set_gui_mode(True)
-
-            with capture_prints(self.message.emit):
-                self.message.emit(f"Parsing demo: {self.demo_path.name}")
-                demo_info = parse_demo(self.demo_path)
-                player = find_player(demo_info, self.player_identifier)
-                self.message.emit(f"Player: {player.name} ({player.steamid})")
-
-                self.message.emit("Preprocessing timeline...")
-                timeline = preprocess_demo(self.demo_path, player.steamid, player.name)
-
-                transitions = None
-                if self.tick_nav:
-                    transitions = load_transitions(self.video_path)
-
-                # Determine output path
-                video_path = self.video_path
-                if self.output_path:
-                    # Copy input to output location, trim will work on it
-                    import shutil
-                    shutil.copy2(self.video_path, self.output_path)
-                    video_path = self.output_path
-
-                # Build a fake console log path (postprocess_video needs it for demo end detection)
-                console_log_path = self.video_path.parent / f"console_{self.demo_path.stem}.log"
-
-                self.message.emit("Trimming...")
-                result_path, keep_segments = postprocess_video(
-                    video_path=video_path,
-                    console_log_path=console_log_path,
-                    verbose=self.verbose,
-                    timeline=timeline,
-                    startup_time_override=self.startup_time,
-                    transitions=transitions,
-                )
-
-                self.message.emit(f"Done: {result_path}")
-                self.finished.emit((result_path, keep_segments))
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.error.emit(f"{type(e).__name__}: {e}\n{tb}")
-        finally:
-            from ..loading import _set_gui_mode
-            _set_gui_mode(False)
+        self._proc = None

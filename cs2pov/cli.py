@@ -10,6 +10,7 @@ Subcommand-based CLI:
 
 import argparse
 import json
+import signal
 import shutil
 import sys
 import time
@@ -247,8 +248,13 @@ def record_demo(
             if verbose:
                 print(f"  Deleted old console.log")
 
-        # Launch CS2
+        # Launch CS2 (kill any stale instance first)
         cs2_process = CS2Process(cs2_path, display_str, log_path=cs2_log_path)
+        existing_pid = cs2_process.find_cs2_process()
+        if existing_pid is not None:
+            print(f"  Warning: Found existing CS2 process (PID: {existing_pid}), terminating...")
+            cs2_process.terminate()
+            time.sleep(2)
         cs2_process.launch("cs2pov_recording.cfg")
         print("  CS2 launching via Steam...")
 
@@ -1608,6 +1614,14 @@ def cmd_comms(args) -> int:
 
 def main() -> int:
     """Main entry point."""
+    # Convert SIGTERM to KeyboardInterrupt so try/finally cleanup runs.
+    # Critical for GUI subprocess: QProcess.terminate() sends SIGTERM,
+    # and without this handler, CS2 and FFmpeg become orphaned processes.
+    def _handle_sigterm(signum, frame):
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     parser = create_parser()
     args = parser.parse_args()
 
