@@ -17,6 +17,7 @@ class FilePicker(QWidget):
         filter_str: str = "",
         save_mode: bool = False,
         directory_mode: bool = False,
+        label_width: int = 100,
         parent=None,
     ):
         super().__init__(parent)
@@ -28,7 +29,7 @@ class FilePicker(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._label = QLabel(label)
-        self._label.setFixedWidth(100)
+        self._label.setFixedWidth(label_width)
         layout.addWidget(self._label)
 
         self._line_edit = QLineEdit()

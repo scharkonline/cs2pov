@@ -2,10 +2,15 @@
 
 import sys
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QMainWindow, QTabWidget, QStatusBar
+from PySide6.QtWidgets import QMainWindow, QSplitter, QStatusBar, QApplication
 
-from .pages import POVPage, InfoPage, TrimPage
+from .job_queue import JobQueuePage
+from .widgets.log_console import LogConsole
+from .widgets.demo_cache import DemoCache
+from .widgets.job_card import JobStatus
+from .workers import BatchJobWorker
 
 
 def _apply_dark_theme(app):
@@ -44,7 +49,7 @@ def _apply_dark_theme(app):
 
 
 class MainWindow(QMainWindow):
-    """Main application window with tabbed interface."""
+    """Main application window with job queue and log console."""
 
     def __init__(self):
         super().__init__()
@@ -52,26 +57,119 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 700)
         self.resize(900, 750)
 
-        from PySide6.QtWidgets import QApplication
         _apply_dark_theme(QApplication.instance())
 
-        tabs = QTabWidget()
-        self._pov_page = POVPage()
-        self._info_page = InfoPage()
-        self._trim_page = TrimPage()
+        self._worker = None
 
-        tabs.addTab(self._pov_page, "POV Recording")
-        tabs.addTab(self._info_page, "Demo Info")
-        tabs.addTab(self._trim_page, "Trim")
+        # Shared demo cache
+        self._demo_cache = DemoCache(self)
 
-        self.setCentralWidget(tabs)
+        # Splitter: job queue (top) + log console (bottom)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        self._job_queue = JobQueuePage(demo_cache=self._demo_cache)
+        splitter.addWidget(self._job_queue)
+
+        self._log = LogConsole()
+        splitter.addWidget(self._log)
+
+        # ~70/30 ratio
+        splitter.setSizes([500, 200])
+        splitter.setHandleWidth(4)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background: #3a3a44; }"
+            "QSplitter::handle:hover { background: #4e9aff; }"
+        )
+
+        self.setCentralWidget(splitter)
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Ready")
 
-        # Platform check: disable recording on non-Linux
-        if sys.platform != "linux":
-            self._pov_page.set_recording_enabled(False)
-            self._status_bar.showMessage("Recording is only available on Linux")
+        # Wire up signals
+        self._demo_cache.parse_complete.connect(self._on_parse_complete)
+        self._demo_cache.parse_error.connect(self._on_parse_error)
+        self._demo_cache.parse_started.connect(
+            lambda p: self._log.append_line(f"Parsing: {p.split('/')[-1]}...")
+        )
 
+        self._job_queue.start_requested.connect(self._on_start_jobs)
+
+        # Platform check
+        if sys.platform != "linux":
+            self._status_bar.showMessage("Recording is only available on Linux (trim/comms still work)")
+
+    def _on_parse_complete(self, path: str, demo_info):
+        self._log.append_line(
+            f"Parsed: {demo_info.map_name}, {len(demo_info.players)} players"
+        )
+        self._job_queue.propagate_players(path, demo_info)
+
+    def _on_parse_error(self, path: str, msg: str):
+        self._log.append_line(f"Parse error ({path.split('/')[-1]}): {msg}")
+
+    def _on_start_jobs(self, jobs: list):
+        if not jobs or self._worker is not None:
+            return
+
+        # Validate jobs
+        for i, job in enumerate(jobs):
+            if not job.get("demo_path"):
+                self._log.append_line(f"Job {i + 1}: No demo file selected.")
+                return
+            if not job.get("player"):
+                self._log.append_line(f"Job {i + 1}: No player selected.")
+                return
+            if job["type"] in ("pov", "record") and not job.get("output_path"):
+                self._log.append_line(f"Job {i + 1}: No output path set.")
+                return
+            if job["type"] == "trim" and not job.get("video_path"):
+                self._log.append_line(f"Job {i + 1}: No video file set.")
+                return
+            if job["type"] == "comms" and (not job.get("video_path") or not job.get("comms_audio_path")):
+                self._log.append_line(f"Job {i + 1}: Video and audio files required for comms.")
+                return
+
+        self._log.clear()
+        self._log.append_line(f"Starting {len(jobs)} job(s)...")
+        self._status_bar.showMessage("Running jobs...")
+
+        # Set all cards to queued
+        cards = self._job_queue.cards()
+        self._job_queue.set_all_locked(True)
+        for card in cards:
+            card.set_status(JobStatus.QUEUED, "Queued")
+
+        self._worker = BatchJobWorker(jobs)
+        self._worker.message.connect(self._log.append_line)
+        self._worker.job_started.connect(self._on_job_started)
+        self._worker.job_finished.connect(self._on_job_finished)
+        self._worker.job_error.connect(self._on_job_error)
+        self._worker.all_finished.connect(self._on_all_finished)
+        self._worker.start()
+
+    def _on_job_started(self, index: int):
+        cards = self._job_queue.cards()
+        if 0 <= index < len(cards):
+            cards[index].set_status(JobStatus.RUNNING, "Running...")
+        self._status_bar.showMessage(f"Running job {index + 1}...")
+
+    def _on_job_finished(self, index: int, success: bool):
+        cards = self._job_queue.cards()
+        if 0 <= index < len(cards):
+            if success:
+                cards[index].set_status(JobStatus.SUCCESS, "Completed")
+            else:
+                cards[index].set_status(JobStatus.FAILED, "Failed")
+
+    def _on_job_error(self, index: int, msg: str):
+        cards = self._job_queue.cards()
+        if 0 <= index < len(cards):
+            cards[index].set_status(JobStatus.FAILED, f"Failed: {msg}")
+
+    def _on_all_finished(self, succeeded: int, total: int):
+        self._worker = None
+        self._job_queue.set_all_locked(False)
+        self._log.append_line(f"\nAll done: {succeeded}/{total} jobs succeeded.")
+        self._status_bar.showMessage(f"Done: {succeeded}/{total} succeeded")
