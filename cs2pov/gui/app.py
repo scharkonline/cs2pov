@@ -98,8 +98,8 @@ class MainWindow(QMainWindow):
         self._job_queue.cancel_requested.connect(self._on_cancel)
 
         # Platform check
-        if sys.platform != "linux":
-            self._status_bar.showMessage("Recording is only available on Linux (trim/comms still work)")
+        if sys.platform not in ("linux", "win32"):
+            self._status_bar.showMessage("Recording is only available on Linux and Windows (trim/comms still work)")
 
     def _on_parse_complete(self, path: str, demo_info):
         self._log.append_line(

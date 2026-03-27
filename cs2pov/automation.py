@@ -1,4 +1,4 @@
-"""CS2 input automation using xdotool - simple, non-threaded functions."""
+"""CS2 input automation - xdotool on Linux, pywin32 on Windows."""
 
 import os
 import re
@@ -9,22 +9,97 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .platform import IS_WINDOWS, IS_LINUX
 
-def check_xdotool():
-    """Check if xdotool is available."""
-    if not shutil.which("xdotool"):
-        raise RuntimeError("xdotool not found. Install with: emerge x11-misc/xdotool")
+
+# =============================================================================
+# Windows key mapping and imports (lazy)
+# =============================================================================
+
+# xdotool key name -> Windows Virtual Key code
+_VK_MAP = {
+    "F2": 0x71,
+    "F5": 0x74,
+    "F6": 0x75,
+    "F7": 0x76,
+    "grave": 0xC0,
+    "Return": 0x0D,
+    "shift": 0x10,
+}
+
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_CHAR = 0x0102
+
+
+def _win32():
+    """Lazy import of win32gui and win32api."""
+    import win32api
+    import win32gui
+    return win32api, win32gui
+
+
+# =============================================================================
+# Public API — dispatches to platform-specific implementations
+# =============================================================================
+
+def check_automation_deps():
+    """Check if automation dependencies are available."""
+    if IS_WINDOWS:
+        try:
+            import win32gui  # noqa: F401
+            import win32api  # noqa: F401
+        except ImportError:
+            raise RuntimeError("pywin32 not found. Install with: pip install pywin32")
+    else:
+        if not shutil.which("xdotool"):
+            raise RuntimeError("xdotool not found. Install with: emerge x11-misc/xdotool")
+
+
+# Keep old name as alias for backwards compatibility in case anything imports it
+check_xdotool = check_automation_deps
 
 
 def find_cs2_window(display: str = ":0") -> Optional[str]:
-    """Find CS2 window ID using xdotool.
+    """Find CS2 window ID.
 
     Args:
-        display: X display where CS2 is running
+        display: X display where CS2 is running (ignored on Windows)
 
     Returns:
-        Window ID string, or None if not found
+        Window ID string (xdotool ID on Linux, hwnd on Windows), or None
     """
+    if IS_WINDOWS:
+        return _find_cs2_window_win()
+    return _find_cs2_window_linux(display)
+
+
+def send_key(key: str, display: str = ":0", window_id: Optional[str] = None) -> bool:
+    """Send a key press to CS2 window.
+
+    Args:
+        key: Key to send (e.g., "F5", "shift+F2", "grave", "Return")
+        display: X display (ignored on Windows)
+        window_id: Optional window ID (will find if not provided)
+
+    Returns:
+        True if successful
+    """
+    if window_id is None:
+        window_id = find_cs2_window(display)
+    if not window_id:
+        return False
+
+    if IS_WINDOWS:
+        return _send_key_win(key, int(window_id))
+    return _send_key_linux(key, display, window_id)
+
+
+# =============================================================================
+# Linux implementations (unchanged from original)
+# =============================================================================
+
+def _find_cs2_window_linux(display: str) -> Optional[str]:
     env = os.environ.copy()
     env["DISPLAY"] = display
 
@@ -38,7 +113,6 @@ def find_cs2_window(display: str = ":0") -> Optional[str]:
         )
         if result.returncode == 0 and result.stdout.strip():
             windows = result.stdout.strip().split('\n')
-            # Return first window found
             if windows and windows[0]:
                 return windows[0]
     except Exception:
@@ -46,22 +120,7 @@ def find_cs2_window(display: str = ":0") -> Optional[str]:
     return None
 
 
-def send_key(key: str, display: str = ":0", window_id: Optional[str] = None) -> bool:
-    """Send a key press to CS2 window.
-
-    Args:
-        key: Key to send (e.g., "F5", "space", "Return")
-        display: X display
-        window_id: Optional window ID (will find if not provided)
-
-    Returns:
-        True if successful
-    """
-    if window_id is None:
-        window_id = find_cs2_window(display)
-    if not window_id:
-        return False
-
+def _send_key_linux(key: str, display: str, window_id: str) -> bool:
     env = os.environ.copy()
     env["DISPLAY"] = display
 
@@ -74,6 +133,104 @@ def send_key(key: str, display: str = ":0", window_id: Optional[str] = None) -> 
             env=env
         )
         return result.returncode == 0
+    except Exception:
+        return False
+
+
+# =============================================================================
+# Windows implementations
+# =============================================================================
+
+def _find_cs2_window_win() -> Optional[str]:
+    """Find CS2 window handle on Windows via EnumWindows."""
+    win32api, win32gui = _win32()
+
+    results = []
+
+    def callback(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if "Counter-Strike 2" in title:
+                results.append(hwnd)
+
+    try:
+        win32gui.EnumWindows(callback, None)
+    except Exception:
+        pass
+
+    return str(results[0]) if results else None
+
+
+def _send_key_win(key: str, hwnd: int) -> bool:
+    """Send a key press to CS2 on Windows via PostMessage."""
+    win32api, win32gui = _win32()
+
+    try:
+        # Handle modifier+key combos like "shift+F2"
+        if "+" in key:
+            parts = key.split("+")
+            modifier = parts[0].lower()
+            main_key = parts[1]
+
+            mod_vk = _VK_MAP.get(modifier)
+            key_vk = _VK_MAP.get(main_key)
+            if mod_vk is None or key_vk is None:
+                return False
+
+            win32api.PostMessage(hwnd, WM_KEYDOWN, mod_vk, 0)
+            time.sleep(0.02)
+            win32api.PostMessage(hwnd, WM_KEYDOWN, key_vk, 0)
+            time.sleep(0.02)
+            win32api.PostMessage(hwnd, WM_KEYUP, key_vk, 0)
+            time.sleep(0.02)
+            win32api.PostMessage(hwnd, WM_KEYUP, mod_vk, 0)
+            return True
+
+        vk = _VK_MAP.get(key)
+        if vk is None:
+            return False
+
+        win32api.PostMessage(hwnd, WM_KEYDOWN, vk, 0)
+        time.sleep(0.02)
+        win32api.PostMessage(hwnd, WM_KEYUP, vk, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _send_console_command_win(command: str, hwnd: int) -> bool:
+    """Send a console command to CS2 on Windows.
+
+    Opens console (grave), types command via WM_CHAR, presses Return, closes console.
+    """
+    win32api, win32gui = _win32()
+
+    try:
+        # Open console
+        grave_vk = _VK_MAP["grave"]
+        win32api.PostMessage(hwnd, WM_KEYDOWN, grave_vk, 0)
+        time.sleep(0.02)
+        win32api.PostMessage(hwnd, WM_KEYUP, grave_vk, 0)
+        time.sleep(0.1)
+
+        # Type command character by character
+        for ch in command:
+            win32api.PostMessage(hwnd, WM_CHAR, ord(ch), 0)
+            time.sleep(0.005)
+        time.sleep(0.05)
+
+        # Press Return
+        return_vk = _VK_MAP["Return"]
+        win32api.PostMessage(hwnd, WM_KEYDOWN, return_vk, 0)
+        time.sleep(0.02)
+        win32api.PostMessage(hwnd, WM_KEYUP, return_vk, 0)
+        time.sleep(0.1)
+
+        # Close console
+        win32api.PostMessage(hwnd, WM_KEYDOWN, grave_vk, 0)
+        time.sleep(0.02)
+        win32api.PostMessage(hwnd, WM_KEYUP, grave_vk, 0)
+        return True
     except Exception:
         return False
 
@@ -312,12 +469,15 @@ def send_console_command(command: str, display: str, window_id: str) -> bool:
 
     Args:
         command: Console command to send (e.g. "demo_gototick 12345")
-        display: X display string
+        display: X display string (ignored on Windows)
         window_id: CS2 window ID
 
     Returns:
-        True if all xdotool steps succeeded
+        True if all steps succeeded
     """
+    if IS_WINDOWS:
+        return _send_console_command_win(command, int(window_id))
+
     env = os.environ.copy()
     env["DISPLAY"] = display
 

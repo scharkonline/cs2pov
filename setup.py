@@ -21,6 +21,7 @@ setup(
     install_requires=requirements,
     extras_require={
         "gui": ["PySide6>=6.5"],
+        "windows": ["pywin32>=306", "sounddevice>=0.4", "psutil>=5.9", "numpy"],
     },
     entry_points={
         "console_scripts": [
@@ -33,6 +34,7 @@ setup(
         "Intended Audience :: End Users/Desktop",
         "License :: OSI Approved :: MIT License",
         "Operating System :: POSIX :: Linux",
+        "Operating System :: Microsoft :: Windows :: Windows 10",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",

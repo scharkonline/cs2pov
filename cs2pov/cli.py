@@ -25,6 +25,7 @@ from .capture import FFmpegCapture, get_default_audio_monitor
 from .config import RecordingConfig, generate_recording_cfg
 from .exceptions import CS2POVError
 from .game import CS2Process, find_cs2_path, get_cfg_dir, get_demo_dir
+from .platform import IS_WINDOWS, IS_LINUX, NULL_PATH, ensure_ffmpeg
 from .settings import (
     ConfigError, find_config, load_config, resolve_job, resolve_paths,
     merge_args_with_config, generate_default_config, HARDCODED_DEFAULTS,
@@ -56,10 +57,19 @@ class RecordingResult:
 def check_dependencies() -> list[str]:
     """Check for required system dependencies."""
     missing = []
-    if not shutil.which("ffmpeg"):
-        missing.append("FFmpeg - Install with: apt install ffmpeg")
-    if not shutil.which("xdotool"):
-        missing.append("xdotool - Install with: apt install xdotool")
+
+    if IS_WINDOWS:
+        # On Windows, ffmpeg is auto-downloaded on first use — just check pywin32
+        try:
+            import win32gui  # noqa: F401
+        except ImportError:
+            missing.append("pywin32 - Install with: pip install pywin32")
+    else:
+        if not shutil.which("ffmpeg"):
+            missing.append("FFmpeg - Install with: apt install ffmpeg")
+        if not shutil.which("xdotool"):
+            missing.append("xdotool - Install with: apt install xdotool")
+
     return missing
 
 
@@ -222,7 +232,7 @@ def record_demo(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Setup paths
-    display_str = f":{display_num}"
+    display_str = f":{display_num}" if IS_LINUX else ""
     console_log_path = cs2_path / "game/csgo/console.log"
     cs2_log_path = output_path.parent / f"{output_path.stem}_cs2.log"
 
@@ -292,13 +302,24 @@ def record_demo(
 
         # Determine audio source
         audio_source = None
+        wasapi_capture = None
         if enable_audio:
-            audio_source = audio_device or get_default_audio_monitor()
-            if audio_source:
-                if verbose:
-                    print(f"  Audio device: {audio_source}")
+            if IS_WINDOWS:
+                # Windows: use WASAPI loopback capture (separate from FFmpeg)
+                try:
+                    from .audio_capture import WasapiCapture
+                    wasapi_capture = WasapiCapture()
+                    wasapi_capture.start()
+                except Exception as e:
+                    print(f"  Warning: WASAPI audio capture failed: {e}")
+                    wasapi_capture = None
             else:
-                print("  Warning: Could not detect audio device, recording video only")
+                audio_source = audio_device or get_default_audio_monitor()
+                if audio_source:
+                    if verbose:
+                        print(f"  Audio device: {audio_source}")
+                else:
+                    print("  Warning: Could not detect audio device, recording video only")
 
         # In tick-nav mode: pause, seek to first segment, then start FFmpeg
         # This synchronizes the demo clock with the recording clock from frame 1
@@ -320,17 +341,20 @@ def record_demo(
                 print("  Warning: Failed to send Shift+F2 to hide demo UI")
 
         # Start FFmpeg capture
+        # On Windows, audio is captured separately via WASAPI — FFmpeg does video only
         ffmpeg = FFmpegCapture(
             display=display_str,
             output_path=output_path,
             resolution=resolution,
             framerate=framerate,
-            audio_device=audio_source if enable_audio else None,
-            enable_audio=enable_audio and audio_source is not None,
+            audio_device=audio_source if (enable_audio and not IS_WINDOWS) else None,
+            enable_audio=(enable_audio and audio_source is not None and not IS_WINDOWS),
         )
         ffmpeg.start()
         if ffmpeg.enable_audio:
             print(f"  FFmpeg capture started (video + audio)")
+        elif wasapi_capture:
+            print(f"  FFmpeg capture started (video) + WASAPI audio")
         else:
             print(f"  FFmpeg capture started (video only)")
 
@@ -374,6 +398,11 @@ def record_demo(
     finally:
         print("\nCleaning up...")
 
+        # Stop WASAPI audio capture first (so we have audio for muxing)
+        if wasapi_capture:
+            print("  Stopping WASAPI audio capture...")
+            wasapi_capture.stop()
+
         if ffmpeg:
             print("  Stopping FFmpeg...")
             graceful = ffmpeg.stop(timeout=15)
@@ -383,6 +412,12 @@ def record_demo(
                 print("  FFmpeg force-stopped")
             if ffmpeg.stderr_path and ffmpeg.stderr_path.exists():
                 print(f"  FFmpeg log: {ffmpeg.stderr_path}")
+
+        # Mux WASAPI audio into video (Windows only)
+        if wasapi_capture and output_path.is_file():
+            print("  Muxing audio into video...")
+            wasapi_capture.mux_audio(output_path, ffmpeg_path=ensure_ffmpeg())
+            wasapi_capture.cleanup()
 
         if cs2_process and cs2_process.is_running():
             print("  Terminating CS2...")
@@ -1420,7 +1455,7 @@ def cmd_trim(args) -> int:
 
             postprocess_video(
                 video_path=output_path,
-                console_log_path=Path("/dev/null"),
+                console_log_path=NULL_PATH,
                 verbose=args.verbose,
                 timeline=timeline,
                 transitions=transitions,
@@ -1429,7 +1464,7 @@ def cmd_trim(args) -> int:
             # Standard path: alive-segment-based trimming
             postprocess_video(
                 video_path=output_path,
-                console_log_path=Path("/dev/null"),
+                console_log_path=NULL_PATH,
                 verbose=args.verbose,
                 timeline=timeline,
                 startup_time_override=args.startup_time,
@@ -1621,12 +1656,19 @@ def main() -> int:
         raise KeyboardInterrupt()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
+    if IS_WINDOWS:
+        # CTRL_BREAK_EVENT is how Windows terminates console processes
+        signal.signal(signal.SIGBREAK, _handle_sigterm)
 
     parser = create_parser()
     args = parser.parse_args()
 
     try:
         if args.command is None:
+            if IS_WINDOWS:
+                from .gui import launch_gui
+                launch_gui()
+                return 0
             return cmd_run(args)
         elif args.command == "init":
             return cmd_init(args)

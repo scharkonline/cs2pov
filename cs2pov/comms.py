@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from .platform import ensure_ffmpeg, ensure_ffprobe
 from .preprocessor import AliveSegment, DemoTimeline, RoundBoundary
 
 
@@ -89,7 +90,7 @@ def _has_audio_stream(video_path: Path) -> bool:
     try:
         result = subprocess.run(
             [
-                "ffprobe",
+                ensure_ffprobe(),
                 "-v", "error",
                 "-select_streams", "a",
                 "-show_entries", "stream=codec_type",
@@ -149,7 +150,7 @@ def extract_comms_segments(
                 print(f"    [Comms] Segment {i}: {start:.2f}s - {end:.2f}s ({duration:.2f}s)")
 
             cmd = [
-                "ffmpeg", "-y",
+                ensure_ffmpeg(), "-y",
                 "-ss", str(start),
                 "-i", str(comms_audio_path),
                 "-t", str(duration),
@@ -179,7 +180,7 @@ def extract_comms_segments(
             print(f"    [Comms] Concatenating {len(segment_paths)} audio segments")
 
         cmd = [
-            "ffmpeg", "-y",
+            ensure_ffmpeg(), "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_file),
@@ -242,7 +243,7 @@ def overlay_comms_on_video(
             f"[game][comms]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         )
         cmd = [
-            "ffmpeg", "-y",
+            ensure_ffmpeg(), "-y",
             "-i", str(video_path),
             "-i", str(comms_audio_path),
             "-filter_complex", filter_complex,
@@ -256,7 +257,7 @@ def overlay_comms_on_video(
     else:
         # No game audio — apply filters to comms and use as sole audio
         cmd = [
-            "ffmpeg", "-y",
+            ensure_ffmpeg(), "-y",
             "-i", str(video_path),
             "-i", str(comms_audio_path),
             "-filter_complex", f"[1:a]{comms_filters}[aout]",
@@ -398,7 +399,7 @@ def apply_comms_overlay(
                 f"[game][comms]amix=inputs=2:duration=first:dropout_transition=0[aout]"
             )
             cmd = [
-                "ffmpeg", "-y",
+                ensure_ffmpeg(), "-y",
                 "-i", str(video_path),
                 "-ss", str(max(0.0, r1_sync_time)),
                 "-i", str(comms_audio_path),
@@ -412,7 +413,7 @@ def apply_comms_overlay(
             ]
         else:
             cmd = [
-                "ffmpeg", "-y",
+                ensure_ffmpeg(), "-y",
                 "-i", str(video_path),
                 "-ss", str(max(0.0, r1_sync_time)),
                 "-i", str(comms_audio_path),

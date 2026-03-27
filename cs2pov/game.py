@@ -7,18 +7,90 @@ from pathlib import Path
 from typing import Optional
 
 from .exceptions import CS2NotFoundError, CS2LaunchError
+from .platform import IS_WINDOWS, IS_LINUX
 
 
 # Common Steam library paths on Linux
-STEAM_PATHS = [
+STEAM_PATHS_LINUX = [
     Path.home() / ".steam/steam/steamapps/common/Counter-Strike Global Offensive",
     Path.home() / ".local/share/Steam/steamapps/common/Counter-Strike Global Offensive",
     Path("/opt/steam/steamapps/common/Counter-Strike Global Offensive"),
     Path("/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Global Offensive"),
 ]
 
+# Common Steam library paths on Windows
+STEAM_PATHS_WIN = [
+    Path("C:/Program Files (x86)/Steam/steamapps/common/Counter-Strike Global Offensive"),
+    Path("D:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive"),
+    Path("E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive"),
+]
+
+STEAM_PATHS = STEAM_PATHS_WIN if IS_WINDOWS else STEAM_PATHS_LINUX
+
 # CS2 Steam App ID
 CS2_APP_ID = 730
+
+
+def _get_steam_library_paths_from_registry() -> list[Path]:
+    """Read Steam install path from Windows registry and find CS2 across library folders."""
+    paths = []
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam")
+        steam_path_str, _ = winreg.QueryValueEx(key, "SteamPath")
+        winreg.CloseKey(key)
+        steam_path = Path(steam_path_str)
+
+        # Direct steamapps path
+        cs2_dir = steam_path / "steamapps/common/Counter-Strike Global Offensive"
+        if cs2_dir.exists():
+            paths.append(cs2_dir)
+
+        # Parse libraryfolders.vdf for additional library locations
+        vdf_path = steam_path / "steamapps/libraryfolders.vdf"
+        if vdf_path.is_file():
+            text = vdf_path.read_text(errors="ignore")
+            import re
+            for match in re.finditer(r'"path"\s+"([^"]+)"', text):
+                lib_path = Path(match.group(1))
+                cs2_dir = lib_path / "steamapps/common/Counter-Strike Global Offensive"
+                if cs2_dir.exists() and cs2_dir not in paths:
+                    paths.append(cs2_dir)
+    except Exception:
+        pass
+    return paths
+
+
+def _find_steam_exe_windows() -> str | None:
+    """Find steam.exe on Windows via registry or known paths."""
+    # Try registry first
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam")
+        steam_exe, _ = winreg.QueryValueEx(key, "SteamExe")
+        winreg.CloseKey(key)
+        if Path(steam_exe).is_file():
+            return steam_exe
+    except Exception:
+        pass
+
+    # Fallback to known paths
+    for candidate in [
+        Path("C:/Program Files (x86)/Steam/steam.exe"),
+        Path("D:/Steam/steam.exe"),
+    ]:
+        if candidate.is_file():
+            return str(candidate)
+
+    # Final fallback: PATH
+    return shutil.which("steam")
+
+
+def _cs2_binary_path(cs2_path: Path) -> Path:
+    """Return the platform-specific CS2 binary path."""
+    if IS_WINDOWS:
+        return cs2_path / "game/bin/win64/cs2.exe"
+    return cs2_path / "game/bin/linuxsteamrt64/cs2"
 
 
 def validate_cs2_path(path: Path) -> Path:
@@ -33,7 +105,7 @@ def validate_cs2_path(path: Path) -> Path:
     Raises:
         CS2NotFoundError: If path doesn't contain CS2
     """
-    cs2_binary = path / "game/bin/linuxsteamrt64/cs2"
+    cs2_binary = _cs2_binary_path(path)
     if cs2_binary.exists():
         return path
     raise CS2NotFoundError(
@@ -63,10 +135,16 @@ def find_cs2_path(custom_path: Optional[Path] = None) -> Path:
     if env_path:
         return validate_cs2_path(Path(env_path))
 
+    # On Windows, also check registry for Steam install location
+    if IS_WINDOWS:
+        registry_paths = _get_steam_library_paths_from_registry()
+        for path in registry_paths:
+            if _cs2_binary_path(path).exists():
+                return path
+
     # Search standard paths
     for path in STEAM_PATHS:
-        cs2_binary = path / "game/bin/linuxsteamrt64/cs2"
-        if cs2_binary.exists():
+        if _cs2_binary_path(path).exists():
             return path
 
     raise CS2NotFoundError(
@@ -103,12 +181,12 @@ def get_cfg_dir(cs2_path: Path) -> Path:
 class CS2Process:
     """Manages CS2 game process for demo playback."""
 
-    def __init__(self, cs2_path: Path, display: str, log_path: Optional[Path] = None):
+    def __init__(self, cs2_path: Path, display: str = "", log_path: Optional[Path] = None):
         """Initialize CS2 process manager.
 
         Args:
             cs2_path: Path to CS2 installation
-            display: X display to use (e.g., ":99")
+            display: X display to use (e.g., ":99"). Ignored on Windows.
             log_path: Optional path for CS2 log output
         """
         self.cs2_path = cs2_path
@@ -127,12 +205,16 @@ class CS2Process:
         Returns:
             The subprocess.Popen object
         """
-        steam_path = shutil.which("steam")
+        if IS_WINDOWS:
+            steam_path = _find_steam_exe_windows()
+        else:
+            steam_path = shutil.which("steam")
         if not steam_path:
-            raise CS2LaunchError("Steam executable not found in PATH")
+            raise CS2LaunchError("Steam executable not found")
 
         env = os.environ.copy()
-        env["DISPLAY"] = self.display
+        if IS_LINUX:
+            env["DISPLAY"] = self.display
 
         # Use steam -applaunch which reliably passes arguments to the game
         cmd = [
@@ -175,7 +257,12 @@ class CS2Process:
         Returns:
             PID of CS2 process, or None if not found
         """
-        # Try multiple patterns to find CS2
+        if IS_WINDOWS:
+            return self._find_cs2_process_windows()
+        return self._find_cs2_process_linux()
+
+    def _find_cs2_process_linux(self) -> Optional[int]:
+        """Find CS2 PID on Linux using pgrep."""
         patterns = [
             ["pgrep", "-x", "cs2"],  # Exact match on process name
             ["pgrep", "-f", "cs2_linux64"],  # Match on command line
@@ -191,13 +278,45 @@ class CS2Process:
                     timeout=5
                 )
                 if result.returncode == 0 and result.stdout.strip():
-                    # Return first matching PID
                     pids = result.stdout.strip().split()
                     if pids:
                         return int(pids[0])
             except Exception:
                 continue
 
+        return None
+
+    def _find_cs2_process_windows(self) -> Optional[int]:
+        """Find CS2 PID on Windows using psutil."""
+        try:
+            import psutil
+        except ImportError:
+            # Fallback: use tasklist
+            return self._find_cs2_process_windows_tasklist()
+
+        for proc in psutil.process_iter(["name", "pid"]):
+            try:
+                if proc.info["name"] and proc.info["name"].lower() == "cs2.exe":
+                    return proc.info["pid"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return None
+
+    def _find_cs2_process_windows_tasklist(self) -> Optional[int]:
+        """Fallback: find CS2 PID using tasklist command."""
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq cs2.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and "cs2.exe" in result.stdout.lower():
+                # CSV format: "cs2.exe","12345","Console","1","xxx K"
+                for line in result.stdout.strip().splitlines():
+                    parts = line.strip('"').split('","')
+                    if len(parts) >= 2:
+                        return int(parts[1])
+        except Exception:
+            pass
         return None
 
     def wait_for_exit(
@@ -302,16 +421,22 @@ class CS2Process:
             self.process = None
             return
 
-        # Try graceful termination with SIGTERM first
+        if IS_WINDOWS:
+            self._terminate_windows(cs2_pid, time)
+        else:
+            self._terminate_linux(cs2_pid, time)
+
+        self.process = None
+
+    def _terminate_linux(self, cs2_pid: int, time):
+        """Terminate CS2 on Linux using POSIX signals."""
         try:
             os.kill(cs2_pid, 15)  # SIGTERM
         except (ProcessLookupError, PermissionError):
             pass
 
-        # Wait a moment for graceful shutdown
         time.sleep(3)
 
-        # If still running, use SIGKILL
         if self.is_running():
             cs2_pid = self.find_cs2_process()
             if cs2_pid:
@@ -320,7 +445,28 @@ class CS2Process:
                 except (ProcessLookupError, PermissionError):
                     pass
 
-        self.process = None
+    def _terminate_windows(self, cs2_pid: int, time):
+        """Terminate CS2 on Windows using taskkill."""
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(cs2_pid)],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+
+        time.sleep(3)
+
+        if self.is_running():
+            cs2_pid = self.find_cs2_process()
+            if cs2_pid:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(cs2_pid), "/F"],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
 
     def __enter__(self):
         return self

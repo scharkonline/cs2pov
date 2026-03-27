@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .exceptions import CaptureError
+from .platform import ensure_ffmpeg, ensure_ffprobe
 
 
 def _transitions_path(video_path: Path) -> Path:
@@ -87,7 +88,7 @@ def get_video_duration(video_path: Path) -> float:
     try:
         result = subprocess.run(
             [
-                "ffprobe",
+                ensure_ffprobe(),
                 "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
@@ -225,7 +226,7 @@ def extract_and_concat_segments(
                 print(f"    [Trim] Extracting segment {i}: {start:.2f}s - {end:.2f}s ({duration:.2f}s)")
 
             cmd = [
-                "ffmpeg",
+                ensure_ffmpeg(),
                 "-y",
                 "-ss", str(start),
                 "-i", str(input_path),
@@ -263,7 +264,7 @@ def extract_and_concat_segments(
 
         # Concatenate segments
         cmd = [
-            "ffmpeg",
+            ensure_ffmpeg(),
             "-y",
             "-f", "concat",
             "-safe", "0",

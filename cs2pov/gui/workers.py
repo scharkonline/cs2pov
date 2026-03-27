@@ -28,6 +28,9 @@ class ParseWorker(QThread):
 
     def run(self):
         try:
+            if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "info", "--json", str(self.demo_path)]
+        else:
             cmd = [sys.executable, "-u", "-m", "cs2pov", "info", "--json", str(self.demo_path)]
             self.message.emit(f"Parsing demo: {self.demo_path.name}")
 
@@ -117,7 +120,10 @@ class CLIJobRunner(QObject):
         self.message.emit(f"Config: {self._config_path}")
         self.message.emit(json.dumps(config, indent=2))
 
-        cmd = [sys.executable, "-u", "-m", "cs2pov", "--config", self._config_path]
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--config", self._config_path]
+        else:
+            cmd = [sys.executable, "-u", "-m", "cs2pov", "--config", self._config_path]
         self.message.emit(f"Running: {' '.join(cmd)}")
 
         self._proc = subprocess.Popen(
