@@ -92,6 +92,13 @@ class FFmpegCapture:
                 + ("Run cs2pov once to auto-download." if IS_WINDOWS else "Install with: apt install ffmpeg")
             )
 
+        # Brief check that it started
+        time.sleep(0.3)
+        if self.process.poll() is not None:
+            self._stderr_file.close()
+            stderr = self.stderr_path.read_text() if self.stderr_path.exists() else ""
+            raise CaptureError(f"FFmpeg failed to start: {stderr}")
+
     def _build_cmd_linux(self, ffmpeg_bin: str, video_size: str) -> list[str]:
         """Build FFmpeg command for Linux (x11grab + PulseAudio)."""
         input_source = f"{self.display}+0,0"
@@ -160,13 +167,6 @@ class FFmpegCapture:
             str(self.output_path),
         ]
         return cmd
-
-        # Brief check that it started
-        time.sleep(0.3)
-        if self.process.poll() is not None:
-            self._stderr_file.close()
-            stderr = self.stderr_path.read_text() if self.stderr_path.exists() else ""
-            raise CaptureError(f"FFmpeg failed to start: {stderr}")
 
     def is_running(self) -> bool:
         """Check if FFmpeg is still running."""
